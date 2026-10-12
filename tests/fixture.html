@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>PDD筛选助手离线测试页面</title>
+<style>
+  body { font: 16px/1.8 system-ui, sans-serif; padding: 32px; background: #f6f7fa; }
+  h1 { font-size: 24px; }
+  #fixture { background: white; padding: 24px; max-width: 720px; border-radius: 12px; }
+  .evaluation_search_btn { display: inline-block; margin: 6px; padding: 6px 18px;
+    border: 1px solid #cfd4dc; border-radius: 5px; cursor: pointer; }
+  .evaluation_search_btn_checked { color: #e02e24; border-color: #e02e24; background: #fff1ef; }
+  #outside { margin-top: 24px; }
+</style>
+<h1>评价筛选 · 离线测试夹具</h1>
+<p>该页面模拟筛选DOM及交互，不连接拼多多服务。</p>
+<main id="fixture"></main>
+<div id="outside">
+  <div class="evaluation_search_btn">4星</div>
+  <button id="query">查询（范围外的测试目标）</button>
+  <button id="reply">提交回复（范围外的测试目标）</button>
+</div>
+<script>
+  'use strict';
+  const mode = new URLSearchParams(location.search).get('mode') || 'normal';
+  window.simulation = {
+    clicks: { '4星': 0, '5星': 0, '未回复': 0 },
+    outsideClicks: 0,
+    selected: new Set(mode === 'selected' ? ['4星', '5星', '未回复']
+      : mode === 'partial' ? ['4星'] : mode === 'conflict' ? ['1星', '已回复'] : []),
+  };
+  const labels = ['1星', '2星', '3星', '4星', '5星', '已回复', '未回复'];
+  function render() {
+    const s = window.simulation;
+    const filters = labels.map(label =>
+      `<div class="evaluation_search_btn ${s.selected.has(label) ? 'evaluation_search_btn_checked' : ''}"
+        ${mode === 'disabled' && label === '4星' ? 'aria-disabled="true"' : ''}>${label}</div>`).join('');
+    document.getElementById('fixture').innerHTML =
+      `<div id="mf-mms-goods-container"><h2>商品评价</h2><div id="filters">${filters}</div></div>`;
+    const filtersElement = document.getElementById('filters');
+    if (mode === 'duplicate') {
+      filtersElement.insertAdjacentHTML('beforeend', '<div class="evaluation_search_btn">4星</div>');
+    }
+    if (mode === 'hidden') {
+      filtersElement.insertAdjacentHTML('beforeend',
+        '<div style="display:none"><div class="evaluation_search_btn">4星</div></div>' +
+        '<div style="opacity:0"><div class="evaluation_search_btn">5星</div></div>');
+    }
+    if (mode === 'duplicate-root') {
+      document.getElementById('fixture').append(document.getElementById('mf-mms-goods-container').cloneNode(true));
+    }
+  }
+  if (mode === 'delayed') setTimeout(render, 250);
+  else render();
+  document.addEventListener('click', event => {
+    const element = event.target.closest('div[class*="evaluation_search_btn"]');
+    if (!element || !element.closest('#mf-mms-goods-container')) {
+      if (event.target.closest('#outside')) window.simulation.outsideClicks++;
+      return;
+    }
+    const label = element.innerText.trim();
+    const s = window.simulation;
+    if (label in s.clicks) s.clicks[label]++;
+    if (mode === 'noop') return;
+    setTimeout(() => {
+      if (mode === 'exclusive' && /^[45]星$/.test(label)) {
+        s.selected.delete('4星');
+        s.selected.delete('5星');
+      }
+      if (label === '未回复') s.selected.delete('已回复');
+      if (s.selected.has(label)) s.selected.delete(label);
+      else s.selected.add(label);
+      if (mode === 'rerender') render();
+      else {
+        element.classList.toggle('evaluation_search_btn_checked', s.selected.has(label));
+        if (label === '未回复') {
+          for (const candidate of document.querySelectorAll('#filters .evaluation_search_btn')) {
+            if (candidate.innerText.trim() === '已回复') candidate.classList.remove('evaluation_search_btn_checked');
+          }
+        }
+        if (mode === 'exclusive') {
+          for (const candidate of document.querySelectorAll('#filters .evaluation_search_btn')) {
+            candidate.classList.toggle('evaluation_search_btn_checked', s.selected.has(candidate.innerText.trim()));
+          }
+        }
+      }
+    }, 25);
+  });
+</script>
+</html>
