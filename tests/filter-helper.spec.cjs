@@ -77,15 +77,8 @@ async function main() {
     assert.equal((await selectAll(page)).code, 'DISABLED_TARGET');
     assert.deepEqual(await counts(page), expectedCounts(0, 0, 0));
   });
-  test('一项禁用不阻止其他独立按钮', 'disabled', async page => {
-    const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('[data-select="4星"]').isDisabled(), true);
-    assert.equal(await panel.locator('#all').isDisabled(), true);
-    await panel.locator('[data-select="5星"]').click();
-    await page.waitForFunction(() => {
-      const shadow = document.getElementById('pdd-evaluation-helper-panel').shadowRoot;
-      return shadow.getElementById('status').dataset.tone === 'success';
-    });
+  test('一项禁用不阻止其他独立筛选接口', 'disabled', async page => {
+    assert.equal((await page.evaluate(() => window.PDDEvaluationHelper.select('5星'))).ok, true);
     assert.deepEqual(await counts(page), expectedCounts(0, 1, 0));
   });
   test('页面忽略click时超时且不重试或继续后续项目', 'noop', async page => {
@@ -138,13 +131,20 @@ async function main() {
     assert.equal((await selectAll(page)).ok, true);
     assert.deepEqual(await counts(page), expectedCounts(1, 1, 1));
   });
-  test('面板按钮可操作，完成后显示实际选中状态', 'normal', async page => {
-    await page.locator('#pdd-evaluation-helper-panel').locator('#all').click();
-    await page.waitForFunction(() => {
-      const shadow = document.getElementById('pdd-evaluation-helper-panel').shadowRoot;
-      return shadow.getElementById('status').dataset.tone === 'success';
-    });
-    assert.equal(await page.locator('#pdd-evaluation-helper-panel').locator('.badge[data-selected="true"]').count(), 3);
+  test('面板保留一键运行和只读检查状态，无星级徽标或独立按钮', 'normal', async page => {
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    assert.equal(await panel.locator('button').count(), 2);
+    assert.equal(await panel.locator('#run-once').innerText(), '一键运行');
+    assert.equal(await panel.locator('#refresh').innerText(), '检查状态');
+    assert.equal(await panel.locator('.badge, [data-select], #all, #stop, #collapse, #export-batch').count(), 0);
+    const before = await panel.locator('#status').innerText();
+    await panel.locator('#refresh').click();
+    assert.match(await panel.locator('#inspection').innerText(), /找到3\/3项，已选0\/3项/);
+    assert.match(await panel.locator('#inspection').innerText(), /手动检查/);
+    assert.equal(await panel.locator('#status').innerText(), before);
+    await selectAll(page);
+    await panel.locator('#refresh').click();
+    assert.match(await panel.locator('#inspection').innerText(), /已选3\/3项/);
     assert.deepEqual(await counts(page), expectedCounts(1, 1, 1));
     if (process.env.PDD_TEST_SCREENSHOT) {
       await page.screenshot({ path: process.env.PDD_TEST_SCREENSHOT, fullPage: true });

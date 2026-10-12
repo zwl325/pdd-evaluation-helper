@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDD评价筛选助手（4星、5星、未回复）
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-12.2
+// @version      2026-10-12.3
 // @description  PDD评价筛选、查询、锁定前N条或全部结果，仅对完全匹配的4/5星模板评价提交统一回复。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：Tampermonkey-点击动作DOM定位清单.md（2026-10-12，非实时DOM）。
   const Config = Object.freeze({
-    version: '2026-10-12.2',
+    version: '2026-10-12.3',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -237,7 +237,7 @@
 
   const Actions = (() => {
     let active = null;
-    let status = { busy: false, tone: 'info', message: '等待评价页加载；选择操作需点击面板按钮。' };
+    let status = { busy: false, tone: 'info', message: '设置参数后点击“一键运行”。' };
     const listeners = new Set();
 
     function notify(next) {
@@ -251,7 +251,7 @@
     }
 
     async function run(labels, checkConflicts = false, borrowedJob = null) {
-      if (active && active !== borrowedJob) throw new HelperError('BUSY', '已有操作正在执行，请等待完成或点击停止。');
+      if (active && active !== borrowedJob) throw new HelperError('BUSY', '已有操作正在执行，请等待完成。');
       if (!Array.isArray(labels) || !labels.length ||
           labels.some((label) => !Config.targets.includes(label))) {
         throw new HelperError('INVALID_TARGET', '仅支持4星、5星、未回复。');
@@ -802,7 +802,7 @@
         if (submitted && rec.status !== 'confirmed') {
           Ledger.submission(rec, 'submitted_unverified', error.code || error.message);
           Ledger.saveBatch(batch);
-          throw new HelperError('SUBMITTED_UNVERIFIED', `订单${rec.order}已发出一次提交，但结果不明。批次停止，禁止自动重试；请人工核查并导出台账。`);
+          throw new HelperError('SUBMITTED_UNVERIFIED', `订单${rec.order}已发出一次提交，但结果不明。批次停止，禁止自动重试；请人工核查，可通过接口导出台账。`);
         }
         throw error;
       } finally {
@@ -813,6 +813,7 @@
   })();
 
   const Workflow = (() => {
+    let navigating = false;
     function params(value = {}) {
       const rawN = value.n;
       const absentN = rawN === undefined || rawN === null || rawN === '';
@@ -903,17 +904,34 @@
         throw error;
       }
     }
+    function navigate(p) {
+      if (navigating || Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
+      const shop = ReviewDOM.shop();
+      if (p.expectedShop && p.expectedShop !== shop) throw new HelperError('SHOP_CHANGED', '启动店铺不符。');
+      Ledger.write(sessionStorage, Config.pendingKey, { schema: 1, action: 'start-batch',
+        params: { ...p, expectedShop: shop }, at: Date.now() });
+      navigating = true;
+      Actions.update({ busy: true, tone: 'info', message: '正在重新加载评价页，随后自动执行…' });
+      try {
+        // 当前就是目标地址时也必须重新加载；同标签页，不创建新窗口。
+        if (location.href === Config.evaluationUrl) location.reload();
+        else location.assign(Config.evaluationUrl);
+      } catch (error) {
+        sessionStorage.removeItem(Config.pendingKey);
+        navigating = false;
+        Actions.update({ busy: false, tone: 'error', message: '评价页跳转失败，请重新执行。' });
+        throw error;
+      }
+      return { navigating: true };
+    }
+    async function oneClickRun(value) {
+      return navigate(params(value));
+    }
+    // 本页编排兼容接口；由消费后的导航任务调用，避免再次刷新形成循环。
     async function start(value) {
       const p = params(value);
-      if (Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
-      if (!/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) {
-        const shop = ReviewDOM.shop();
-        if (p.expectedShop && p.expectedShop !== shop) throw new HelperError('SHOP_CHANGED', '启动店铺不符。');
-        Ledger.write(sessionStorage, Config.pendingKey, { schema: 1, action: 'start-batch',
-          params: { ...p, expectedShop: shop }, at: Date.now() });
-        location.assign(Config.evaluationUrl);
-        return { navigating: true };
-      }
+      if (navigating || Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
+      if (!/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) return navigate(p);
       return Actions.runTask(async job => {
         if (!navigator.locks?.request) throw new HelperError('LOCK_UNAVAILABLE', '当前浏览器不支持批次互斥锁，未开始提交。');
         return navigator.locks.request(Config.lockName, { ifAvailable: true }, async lock => {
@@ -932,18 +950,60 @@
             !pending.params?.expectedShop || !/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) {
           throw new HelperError('EXPIRED_START', '跳转任务已过期或页面不符，请手动重新启动。');
         }
+        Panel.setParams(pending.params);
         await start(pending.params);
       } catch (error) {
         Actions.update({ tone: 'error', message: error.message });
       }
     }
-    return Object.freeze({ start, continueNavigation });
+    function restoreNavigation() {
+      if (!navigating) return;
+      navigating = false;
+      Actions.update({ busy: false, tone: 'info', message: '已返回页面，点击“一键运行”可重新启动。' });
+    }
+    return Object.freeze({ start, oneClickRun, continueNavigation, restoreNavigation });
   })();
 
   const Panel = (() => {
     let host;
     let shadow;
     let lastRender = '';
+    let checkedAt = '';
+
+    // 观察入口只读取筛选和本机批次快照，不触发点击、查询或提交。
+    function inspection() {
+      try {
+        const state = DOM.snapshot();
+        const found = state.targets.filter(target => target.found).length;
+        const selected = state.targets.filter(target => target.selected).length;
+        let message = state.error || (state.pageFound
+          ? `筛选${state.ready ? '就绪' : '未就绪'}：找到${found}/3项，已选${selected}/3项。`
+          : '未发现评价区域，等待进入评价页。');
+        const problems = state.targets.filter(target => target.error ||
+          (target.found && !target.enabled && !target.selected));
+        if (problems.length) message += `\n${problems.map(target =>
+          `${target.label}：${target.error || '不可点击'}`).join('；')}。`;
+        if (state.otherSelected.length) message += `\n冲突条件：${state.otherSelected.join('、')}。`;
+        const batch = Ledger.lastBatch();
+        if (batch && Array.isArray(batch.records)) {
+          const phases = { querying: '筛选与查询', freezing: '锁定检查范围',
+            replying: '逐条检查与回复', completed: '已完成', stopped: '已停止' };
+          const records = batch.records;
+          const replied = records.filter(rec => rec.status === 'confirmed').length;
+          const skipped = records.filter(rec => rec.status?.startsWith('skipped_')).length;
+          const uncertain = records.filter(rec =>
+            ['submitting', 'submitted_unverified'].includes(rec.status)).length;
+          message += `\n最近批次：${phases[batch.phase] || '未知阶段'}。`
+            + `\n已检查${replied + skipped}/${records.length}条；确认回复${replied}条；跳过${skipped}条。`;
+          if (uncertain) message += `\n待核验提交：${uncertain}条。`;
+          if (batch.error?.message) message += `\n停止原因：${batch.error.message}`;
+        } else message += '\n尚无批次记录。';
+        if (checkedAt) message += `\n手动检查：${checkedAt}；状态持续自动更新。`;
+        return { message, tone: state.error || problems.length || state.otherSelected.length ? 'error' : 'info' };
+      } catch (error) {
+        return { message: `状态读取失败：${error.message}`, tone: 'error' };
+      }
+    }
 
     function mount() {
       if (host?.isConnected) return;
@@ -961,96 +1021,49 @@
           header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px;
             background: #fff5f4; border-bottom: 1px solid #f2dedc; }
           strong { font-size: 14px; font-weight: 700; }
+          .version { font-size: 11px; color: #737c8c; }
           button { font: inherit; cursor: pointer; border: 1px solid #dce0e7; background: #fff;
             color: #303746; border-radius: 7px; padding: 6px 9px; }
           button:hover:enabled { border-color: #e02e24; background: #fff5f4; }
           button:focus-visible { outline: 2px solid #e02e24; outline-offset: 2px; }
           button:disabled { opacity: .45; cursor: not-allowed; }
-          #collapse { border: 0; background: transparent; padding: 0 4px; }
           #body { padding: 12px 14px 14px; max-height: calc(100vh - 120px); overflow: auto; }
           [hidden] { display: none !important; }
-          #state { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 10px; }
-          .badge { text-align: center; background: #f1f3f7; color: #5f6878; border-radius: 6px; padding: 5px 2px; }
-          .badge[data-selected="true"] { background: #eaf6ef; color: #207442; }
-          .choices { display: flex; gap: 6px; }
-          .choices button { flex: 1; }
-          #all { width: 100%; margin-top: 8px; background: #e02e24; color: #fff; border-color: #e02e24; }
-          #all:hover:enabled { background: #c8241b; }
-          .utility { display: flex; gap: 6px; margin-top: 8px; }
           #status { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; font-size: 12px; color: #626b7a; }
           #status[data-tone="success"] { color: #207442; }
           #status[data-tone="error"] { color: #b32c22; }
-          #others { margin-top: 8px; color: #a96510; font-size: 12px; }
+          #refresh { margin-top: 9px; padding: 4px 9px; font-size: 12px; }
+          #inspection { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; padding: 8px;
+            border-radius: 6px; background: #f6f7fa; font-size: 12px; color: #626b7a; }
+          #inspection[data-tone="error"] { color: #b32c22; }
           .hint { color: #737c8c; margin: 9px 0 0; font-size: 11px; }
-          .batch { border-top: 1px solid #e3e5eb; margin-top: 12px; padding-top: 10px; }
-          .batch label { display: block; font-size: 12px; margin-top: 6px; }
+          label { display: block; font-size: 12px; margin-top: 6px; }
           input { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid #dce0e7; border-radius: 6px; }
-          #start-batch { width: 100%; margin-top: 10px; background: #e02e24; color: white; border-color: #e02e24; }
-          #start-batch:hover:enabled { background: #c8241b; }
-          details { font-size: 11px; color: #626b7a; margin-top: 8px; }
-          #reply-copy { overflow-wrap: anywhere; margin-top: 5px; }
+          #run-once { width: 100%; margin-top: 12px; background: #e02e24; color: white; border-color: #e02e24; }
+          #run-once:hover:enabled { background: #c8241b; }
         </style>
-        <section aria-label="PDD评价筛选助手">
-          <header><strong>PDD 评价筛选助手</strong>
-            <button id="collapse" type="button" aria-expanded="true" title="收起面板">收起</button></header>
+        <section aria-label="PDD评价自动回复">
+          <header><strong>PDD 评价自动回复</strong><span class="version">${Config.version}</span></header>
           <div id="body">
-            <div id="state">
-              <span class="badge" data-label="4星"></span>
-              <span class="badge" data-label="5星"></span>
-              <span class="badge" data-label="未回复"></span>
-            </div>
-            <div class="choices">
-              <button type="button" data-select="4星">选择4星</button>
-              <button type="button" data-select="5星">选择5星</button>
-              <button type="button" data-select="未回复">选择未回复</button>
-            </div>
-            <button id="all" type="button">一键选择 4星 + 5星 + 未回复</button>
-            <div class="utility">
-              <button id="refresh" type="button">检查状态</button>
-              <button id="stop" type="button" disabled>停止</button>
-            </div>
+            <label for="batch-n">检查数量 N（留空＝全部结果）</label>
+            <input id="batch-n" type="text" inputmode="numeric" placeholder="例如 5；N不是回复数量">
+            <label for="batch-goods">商品 ID（可选）</label>
+            <input id="batch-goods" type="text" inputmode="numeric" placeholder="留空查询全部商品">
+            <button id="run-once" type="button">一键运行</button>
             <p id="status" role="status" aria-live="polite"></p>
-            <div id="others" hidden></div>
-            <div class="batch">
-              <strong>查询与模板评价回复</strong>
-              <label for="batch-n">检查数量 N（留空＝全部结果）</label>
-              <input id="batch-n" type="text" inputmode="numeric" placeholder="例如 5；N不是回复数量">
-              <label for="batch-goods">商品 ID（可选，留空会清除旧值）</label>
-              <input id="batch-goods" type="text" inputmode="numeric" placeholder="仅填写明确指定的商品 ID">
-              <button id="start-batch" type="button">开始查询并自动回复</button>
-              <button id="export-batch" type="button" style="margin-top:8px">导出本机台账</button>
-              <details><summary>查看统一回复文案</summary><div id="reply-copy"></div></details>
-              <p class="hint">启动后自动进入评价页、查询、锁定范围并提交符合模板的回复。日期沿用页面条件。N留空会遍历全部结果。</p>
-            </div>
+            <button id="refresh" type="button">检查状态</button>
+            <p id="inspection" role="status" aria-live="polite"></p>
+            <p class="hint">重新加载评价页后，自动查询并回复模板好评。N留空处理全部结果。</p>
           </div>
         </section>`;
-      for (const button of shadow.querySelectorAll('[data-select]')) {
-        button.addEventListener('click', () => {
-          // Actions已经将失败反馈到面板；吞掉UI入口的Promise拒绝，避免未处理异常。
-          void Actions.select(button.dataset.select).catch(() => {});
-        });
-      }
-      shadow.querySelector('#all').addEventListener('click', () => {
-        void Actions.selectAll().catch(() => {});
-      });
-      shadow.querySelector('#refresh').addEventListener('click', render);
-      shadow.querySelector('#stop').addEventListener('click', Actions.cancel);
-      shadow.querySelector('#reply-copy').textContent = Config.replyText;
-      shadow.querySelector('#start-batch').addEventListener('click', () => {
-        void Workflow.start({ n: shadow.querySelector('#batch-n').value,
+      shadow.querySelector('#run-once').addEventListener('click', () => {
+        void Workflow.oneClickRun({ n: shadow.querySelector('#batch-n').value,
           goodsId: shadow.querySelector('#batch-goods').value })
           .catch(error => Actions.update({ tone: 'error', message: error.message }));
       });
-      shadow.querySelector('#export-batch').addEventListener('click', () => {
-        try { Ledger.exportData(); } catch (error) { Actions.update({ tone: 'error', message: error.message }); }
-      });
-      shadow.querySelector('#collapse').addEventListener('click', () => {
-        const body = shadow.querySelector('#body');
-        const button = shadow.querySelector('#collapse');
-        body.hidden = !body.hidden;
-        button.textContent = body.hidden ? '展开' : '收起';
-        button.setAttribute('aria-expanded', String(!body.hidden));
-        button.title = body.hidden ? '展开面板' : '收起面板';
+      shadow.querySelector('#refresh').addEventListener('click', () => {
+        checkedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        render();
       });
       document.body.append(host);
       lastRender = '';
@@ -1062,40 +1075,21 @@
       host.hidden = !supported;
       host.style.display = supported ? 'block' : 'none';
       if (!supported) return;
-      const state = DOM.snapshot();
       const status = Actions.status();
+      const reading = inspection();
       // 高频mutation不反复更新相同的面板内容。
-      const fingerprint = JSON.stringify({ state, status });
+      const fingerprint = JSON.stringify({ status, reading });
       if (fingerprint === lastRender) return;
       lastRender = fingerprint;
-      const pageIdentified = state.targets.length === Config.targets.length &&
-        state.targets.every((target) => target.found);
-      for (const label of Config.targets) {
-        const target = state.targets.find((item) => item.label === label);
-        const badge = [...shadow.querySelectorAll('.badge')].find((item) => item.dataset.label === label);
-        const button = [...shadow.querySelectorAll('[data-select]')].find((item) => item.dataset.select === label);
-        const value = !target?.found ? '未就绪' : target.selected ? '已选' : target.enabled ? '未选' : '禁用';
-        badge.textContent = `${label} · ${value}`;
-        badge.dataset.selected = String(Boolean(target?.selected));
-        badge.title = target?.error || '';
-        button.disabled = status.busy || !pageIdentified || !(target?.enabled || target?.selected);
-      }
-      shadow.querySelector('#all').disabled = status.busy || !state.ready;
-      shadow.querySelector('#stop').disabled = !status.busy;
-      shadow.querySelector('#start-batch').disabled = status.busy;
+      shadow.querySelector('#run-once').disabled = status.busy;
       shadow.querySelector('#batch-n').disabled = status.busy;
       shadow.querySelector('#batch-goods').disabled = status.busy;
       const feedback = shadow.querySelector('#status');
-      const unavailable = state.error || state.targets
-        .filter((target) => !target.found || !target.enabled && !target.selected)
-        .map((target) => `${target.label}：${target.error || '当前禁用'}`).join('；');
-      feedback.textContent = !status.busy && status.tone === 'info' && !state.ready
-        ? `请打开商品评价页并等待筛选区域加载。${unavailable ? `\n${unavailable}` : ''}`
-        : status.message;
+      feedback.textContent = status.message;
       feedback.dataset.tone = status.tone;
-      const others = shadow.querySelector('#others');
-      others.hidden = !state.otherSelected.length;
-      others.textContent = `其他已选条件：${state.otherSelected.join('、')}。请核查。`;
+      const details = shadow.querySelector('#inspection');
+      details.textContent = reading.message;
+      details.dataset.tone = reading.tone;
     }
 
     function destroy() {
@@ -1105,7 +1099,14 @@
       lastRender = '';
     }
 
-    return Object.freeze({ render, destroy, contains: (node) => Boolean(host && (node === host || host.contains(node))) });
+    function setParams(params) {
+      mount();
+      shadow.querySelector('#batch-n').value = params.n === null ? '' : String(params.n);
+      shadow.querySelector('#batch-goods').value = params.goodsId || '';
+    }
+
+    return Object.freeze({ render, destroy, setParams,
+      contains: (node) => Boolean(host && (node === host || host.contains(node))) });
   })();
 
   const App = (() => {
@@ -1170,7 +1171,10 @@
 
     // BFCache恢复时重新挂载，避免返回页面后监听失效。
     window.addEventListener('pagehide', stop);
-    window.addEventListener('pageshow', start);
+    window.addEventListener('pageshow', event => {
+      if (event.persisted) Workflow.restoreNavigation();
+      start();
+    });
     return Object.freeze({ start });
   })();
 
@@ -1182,6 +1186,8 @@
       version: Config.version,
       readState: DOM.snapshot,
       startBatch: Workflow.start,
+      oneClickRun: Workflow.oneClickRun,
+      exportLedger: Ledger.exportData,
       readBatch: Ledger.lastBatch,
       readSubmissionJournal: Ledger.journal,
       resolveSubmission: Ledger.resolve,

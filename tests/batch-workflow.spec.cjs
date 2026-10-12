@@ -19,6 +19,25 @@ const state = page => page.evaluate(() => ({ submissions: window.sim.submissions
   opens: window.sim.opens, queries: window.sim.queries, page: window.sim.page,
   goods: document.querySelector('#goodsId input').value, goodsEvents: window.sim.goodsEvents,
   visited: window.sim.visited, batch: window.PDDEvaluationHelper.readBatch() }));
+const evaluationUrl = 'https://mms.pinduoduo.com/goods/evaluation/index?msfrom=mms_sidenav';
+
+async function enableNavigationInjection(page) {
+  // 模拟Tampermonkey在完整页面加载后的注入；仅用于被拦截的离线夹具。
+  await page.addInitScript({ content:
+    `document.addEventListener('DOMContentLoaded', () => {\n${source}\n}, { once: true });` });
+}
+
+async function clickRunAndWait(page) {
+  const previousBatchId = await page.evaluate(() => window.PDDEvaluationHelper?.readBatch()?.id || null);
+  const navigation = page.waitForEvent('framenavigated', { predicate: frame => frame === page.mainFrame() });
+  await page.locator('#pdd-evaluation-helper-panel').locator('#run-once').click();
+  await navigation;
+  assert.equal(page.url(), evaluationUrl);
+  await page.waitForFunction(previousId => {
+    const batch = window.PDDEvaluationHelper?.readBatch();
+    return batch?.phase === 'completed' && batch.id !== previousId;
+  }, previousBatchId);
+}
 
 async function main() {
   const browser = await chromium.launch({ headless: true,
@@ -254,26 +273,120 @@ async function main() {
     assert.equal((await run(page, { goodsId: 'ID: 9001' })).code, 'INVALID_GOODS_ID');
     assert.equal((await state(page)).queries, 0);
   });
-  test('面板启动功能可执行并导出状态', 'normal', async page => {
+  test('一键运行先刷新到指定地址，再筛选查询回复；保留检查状态', 'normal', async page => {
+    await enableNavigationInjection(page);
     const panel = page.locator('#pdd-evaluation-helper-panel');
+    assert.equal(await panel.locator('button').count(), 2);
     await panel.locator('#batch-n').fill('2');
-    await panel.locator('#start-batch').click();
-    await page.waitForFunction(() => window.PDDEvaluationHelper.readBatch()?.phase === 'completed');
+    await page.evaluate(() => { window.beforeReloadMarker = true; });
+    await clickRunAndWait(page);
+    const s = await state(page);
+    assert.equal(await page.evaluate(() => window.beforeReloadMarker), undefined);
+    assert.equal(s.queries, 1);
+    assert.equal(s.submissions.length, 1);
+    assert.deepEqual(await page.evaluate(() => window.sim.filterClicks), ['4星', '5星', '未回复']);
+    assert.equal(await panel.locator('#batch-n').inputValue(), '2');
+    assert.equal(await panel.locator('button').count(), 2);
+    assert.equal(await panel.locator('#run-once').isDisabled(), false);
+    await panel.locator('#refresh').click();
+    assert.match(await panel.locator('#inspection').innerText(), /已检查2\/2条；确认回复1条；跳过1条/);
+    assert.equal((await state(page)).queries, 1);
     assert.equal((await state(page)).submissions.length, 1);
     if (process.env.PDD_BATCH_SCREENSHOT) await page.screenshot({ path: process.env.PDD_BATCH_SCREENSHOT, fullPage: true });
   });
-  test('从首页自动跳转并一次性继续，刷新不重跑', 'normal', async (page, context) => {
+  test('已在完全相同的目标地址也刷新，当前标签页只加载一次', 'normal', async (page, context) => {
+    await enableNavigationInjection(page);
+    await page.goto(evaluationUrl);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#batch-n').fill('1');
+    await page.evaluate(() => { window.beforeReloadMarker = true; });
+    let navigations = 0;
+    page.on('framenavigated', frame => { if (frame === page.mainFrame()) navigations++; });
+    const initialTabs = context.pages().length;
+    await clickRunAndWait(page);
+    assert.equal(await page.evaluate(() => window.beforeReloadMarker), undefined);
+    assert.equal(navigations, 1, '不能产生重复刷新循环');
+    assert.equal(context.pages().length, initialTabs, '必须复用当前标签页');
+    assert.equal((await state(page)).submissions.length, 1);
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('pdd-evaluation-helper:pending:v1')), null);
+  });
+  test('从首页一键跳转并一次性继续，刷新不重跑', 'normal', async (page, context) => {
+    await enableNavigationInjection(page);
     await page.goto('https://mms.pinduoduo.com/home/');
-    await page.addScriptTag({ content: source });
-    await page.evaluate(() => { void window.PDDEvaluationHelper.startBatch({ n: 1 }); });
-    await page.waitForURL('**/goods/evaluation/index?msfrom=mms_sidenav');
-    await page.addScriptTag({ content: source });
-    await page.waitForFunction(() => window.PDDEvaluationHelper.readBatch()?.phase === 'completed');
+    await page.locator('#pdd-evaluation-helper-panel').locator('#batch-n').fill('1');
+    await clickRunAndWait(page);
     assert.equal((await state(page)).submissions.length, 1);
     await page.reload();
-    await page.addScriptTag({ content: source });
+    await page.waitForFunction(() => Boolean(window.PDDEvaluationHelper));
     assert.equal((await state(page)).queries, 0);
     assert.equal((await state(page)).submissions.length, 0);
+  });
+  test('跳转后返回首页可再次运行，已确认的身份不会重复提交', 'normal', async page => {
+    await enableNavigationInjection(page);
+    await page.goto('https://mms.pinduoduo.com/home/');
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#batch-n').fill('1');
+    await clickRunAndWait(page);
+    assert.equal((await state(page)).submissions.length, 1);
+    await page.goBack();
+    await page.waitForFunction(() => Boolean(window.PDDEvaluationHelper));
+    assert.equal(page.url(), 'https://mms.pinduoduo.com/home/');
+    assert.equal(await panel.locator('#run-once').isDisabled(), false);
+    await panel.locator('#batch-n').fill('1');
+    await clickRunAndWait(page);
+    assert.deepEqual((await state(page)).batch.summary, { checked: 1, replied: 0, skipped: 1 });
+    assert.equal((await state(page)).submissions.length, 0);
+  });
+  test('一键刷新后保留N和指定商品ID，不丢失参数', 'normal', async page => {
+    await enableNavigationInjection(page);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#batch-n').fill('1');
+    await panel.locator('#batch-goods').fill('9001');
+    await clickRunAndWait(page);
+    const s = await state(page);
+    assert.equal(s.goods, '9001');
+    assert.equal(s.batch.params.n, 1);
+    assert.equal(s.batch.params.goodsId, '9001');
+    assert.equal(s.batch.records.length, 1);
+    assert.equal(await panel.locator('#batch-goods').inputValue(), '9001');
+  });
+  test('一键运行留空N与商品时执行全部查询结果', 'normal', async page => {
+    await enableNavigationInjection(page);
+    await clickRunAndWait(page);
+    const s = await state(page);
+    assert.deepEqual(s.batch.summary, { checked: 6, replied: 3, skipped: 3 });
+    assert.equal(s.goods, '');
+  });
+  test('一键运行参数非法时不刷新、不查询，运行按钮仍可用', 'normal', async page => {
+    const before = page.url();
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#batch-n').fill('abc');
+    await panel.locator('#run-once').click();
+    await page.waitForFunction(() => document.getElementById('pdd-evaluation-helper-panel')
+      .shadowRoot.getElementById('status').dataset.tone === 'error');
+    assert.equal(page.url(), before);
+    assert.equal((await state(page)).queries, 0);
+    assert.equal(await panel.locator('#run-once').isDisabled(), false);
+  });
+  test('运行期间检查状态可用且不新增查询或提交，不覆盖当前进度', 'query-noop', async page => {
+    await page.evaluate(() => {
+      window.pending = window.PDDEvaluationHelper.startBatch({ n: 1 })
+        .catch(error => ({ code: error.code }));
+    });
+    await page.waitForFunction(() => window.sim.queries === 1);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    const before = await panel.locator('#status').innerText();
+    assert.equal(await panel.locator('#run-once').isDisabled(), true);
+    assert.equal(await panel.locator('#refresh').isDisabled(), false);
+    await panel.locator('#refresh').click();
+    assert.match(await panel.locator('#inspection').innerText(), /筛选与查询/);
+    assert.equal(await panel.locator('#status').innerText(), before);
+    assert.equal((await state(page)).queries, 1);
+    assert.equal((await state(page)).submissions.length, 0);
+    assert.equal((await page.evaluate(() => window.pending)).code, 'TIMEOUT');
+    await panel.locator('#refresh').click();
+    assert.match(await panel.locator('#inspection').innerText(), /已停止/);
+    assert.match(await panel.locator('#inspection').innerText(), /停止原因/);
   });
   test('损坏或过期导航标记不启动全部回复', 'normal', async page => {
     await page.evaluate(() => {
