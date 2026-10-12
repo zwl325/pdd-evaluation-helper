@@ -131,12 +131,14 @@ async function main() {
     assert.equal((await selectAll(page)).ok, true);
     assert.deepEqual(await counts(page), expectedCounts(1, 1, 1));
   });
-  test('面板保留一键运行和只读检查状态，无星级徽标或独立按钮', 'normal', async page => {
+  test('面板保留一键运行、检查状态、导出台账和文案入口，无星级徽标或独立按钮', 'normal', async page => {
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('button').count(), 2);
+    assert.equal(await panel.locator('button').count(), 3);
     assert.equal(await panel.locator('#run-once').innerText(), '一键运行');
     assert.equal(await panel.locator('#refresh').innerText(), '检查状态');
-    assert.equal(await panel.locator('.badge, [data-select], #all, #stop, #collapse, #export-batch').count(), 0);
+    assert.equal(await panel.locator('#export-batch').innerText(), '导出本机台账');
+    assert.equal(await panel.locator('summary').innerText(), '查看统一回复文案');
+    assert.equal(await panel.locator('.badge, [data-select], #all, #stop, #collapse').count(), 0);
     const before = await panel.locator('#status').innerText();
     await panel.locator('#refresh').click();
     assert.match(await panel.locator('#inspection').innerText(), /找到3\/3项，已选0\/3项/);
@@ -149,6 +151,22 @@ async function main() {
     if (process.env.PDD_TEST_SCREENSHOT) {
       await page.screenshot({ path: process.env.PDD_TEST_SCREENSHOT, fullPage: true });
     }
+  });
+  test('后台其他路径和SPA切换后面板仍可打开，缺少评价区域不是错误', 'normal', async page => {
+    await page.evaluate(() => {
+      document.getElementById('mf-mms-goods-container').remove();
+      history.pushState({}, '', '/orders/list');
+    });
+    await page.waitForFunction(() => document.getElementById('pdd-evaluation-helper-panel')
+      .shadowRoot.getElementById('inspection').textContent.includes('自动进入评价页'));
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    assert.equal(await panel.isVisible(), true);
+    assert.equal(await panel.locator('#run-once').isDisabled(), false);
+    assert.equal(await panel.locator('#inspection').getAttribute('data-tone'), 'info');
+    await page.evaluate(() => history.pushState({}, '', '/finance/overview'));
+    await panel.locator('#refresh').click();
+    assert.equal(await panel.isVisible(), true);
+    assert.deepEqual(await counts(page), expectedCounts(0, 0, 0));
   });
   test('未知目标被拒绝', 'normal', async page => {
     const code = await page.evaluate(() =>

@@ -20,6 +20,10 @@ const state = page => page.evaluate(() => ({ submissions: window.sim.submissions
   goods: document.querySelector('#goodsId input').value, goodsEvents: window.sim.goodsEvents,
   visited: window.sim.visited, batch: window.PDDEvaluationHelper.readBatch() }));
 const evaluationUrl = 'https://mms.pinduoduo.com/goods/evaluation/index?msfrom=mms_sidenav';
+const otherPage = shop => `<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+  <title>其他后台页 · 离线夹具</title><body>
+  ${shop ? `<div>${shop}<br>${shop}：测试子账号<br>退出当前账号</div><div>后台首页</div>` : ''}
+  <h1>其他后台页 · 合成测试数据</h1><p>此页没有评价区域。</p></body></html>`;
 
 async function enableNavigationInjection(page) {
   // 模拟Tampermonkey在完整页面加载后的注入；仅用于被拦截的离线夹具。
@@ -276,7 +280,7 @@ async function main() {
   test('一键运行先刷新到指定地址，再筛选查询回复；保留检查状态', 'normal', async page => {
     await enableNavigationInjection(page);
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('button').count(), 2);
+    assert.equal(await panel.locator('button').count(), 3);
     await panel.locator('#batch-n').fill('2');
     await page.evaluate(() => { window.beforeReloadMarker = true; });
     await clickRunAndWait(page);
@@ -286,13 +290,111 @@ async function main() {
     assert.equal(s.submissions.length, 1);
     assert.deepEqual(await page.evaluate(() => window.sim.filterClicks), ['4星', '5星', '未回复']);
     assert.equal(await panel.locator('#batch-n').inputValue(), '2');
-    assert.equal(await panel.locator('button').count(), 2);
+    assert.equal(await panel.locator('button').count(), 3);
     assert.equal(await panel.locator('#run-once').isDisabled(), false);
     await panel.locator('#refresh').click();
     assert.match(await panel.locator('#inspection').innerText(), /已检查2\/2条；确认回复1条；跳过1条/);
     assert.equal((await state(page)).queries, 1);
     assert.equal((await state(page)).submissions.length, 1);
     if (process.env.PDD_BATCH_SCREENSHOT) await page.screenshot({ path: process.env.PDD_BATCH_SCREENSHOT, fullPage: true });
+  });
+  test('面板查看原文和导出实际本机台账，均不新增查询或提交', 'normal', async page => {
+    const result = await run(page, { n: 2 });
+    assert.equal(result.ok, true);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('summary').click();
+    assert.equal(await panel.locator('#reply-copy').isVisible(), true);
+    assert.equal(await panel.locator('#reply-copy').innerText(), replyText);
+    assert.equal(replyText.length, 145);
+    const downloadStarted = page.waitForEvent('download');
+    await panel.locator('#export-batch').click();
+    const download = await downloadStarted;
+    assert.match(download.suggestedFilename(), /^pdd-evaluation-\d+\.json$/);
+    const data = JSON.parse(fs.readFileSync(await download.path(), 'utf8'));
+    assert.equal(data.batch.id, result.batch.id);
+    assert.deepEqual(data.batch.summary, { checked: 2, replied: 1, skipped: 1 });
+    assert.equal(data.batch.records.length, 2);
+    assert.equal(Object.values(data.journal.entries).length, 1);
+    assert.equal(Object.values(data.journal.entries)[0].status, 'confirmed');
+    assert.equal(Object.values(data.journal.entries)[0].replyText, replyText);
+    assert.equal((await state(page)).queries, 1);
+    assert.equal((await state(page)).submissions.length, 1);
+  });
+  test('其他后台页没有评价DOM也能一键跳转，保留参数并执行', 'normal', async (page, context) => {
+    const sourceUrl = 'https://mms.pinduoduo.com/orders/list';
+    await context.route(sourceUrl, route => route.fulfill({ status: 200,
+      contentType: 'text/html; charset=utf-8', body: otherPage('测试店铺') }));
+    await enableNavigationInjection(page);
+    await page.goto(sourceUrl);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    assert.equal(await panel.isVisible(), true);
+    assert.equal(await page.evaluate(() => window.PDDEvaluationHelper.readState().pageFound), false);
+    assert.equal(await panel.locator('#run-once').isDisabled(), false);
+    await panel.locator('#batch-n').fill('1');
+    await panel.locator('#batch-goods').fill('9001');
+    const originalTabs = context.pages().length;
+    await clickRunAndWait(page);
+    const s = await state(page);
+    assert.equal(context.pages().length, originalTabs);
+    assert.deepEqual(s.batch.summary, { checked: 1, replied: 1, skipped: 0 });
+    assert.equal(s.batch.params.goodsId, '9001');
+    assert.equal(s.batch.params.expectedShop, '测试店铺');
+    assert.deepEqual(await page.evaluate(() => window.sim.filterClicks), ['4星', '5星', '未回复']);
+  });
+  test('其他后台页无法读取店铺也能先跳转，在评价页严格识别店铺', 'normal', async (page, context) => {
+    const sourceUrl = 'https://mms.pinduoduo.com/goods/manage';
+    await context.route(sourceUrl, route => route.fulfill({ status: 200,
+      contentType: 'text/html; charset=utf-8', body: otherPage(null) }));
+    await enableNavigationInjection(page);
+    await page.goto(sourceUrl);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    assert.equal(await panel.isVisible(), true);
+    await panel.locator('#batch-n').fill('1');
+    await clickRunAndWait(page);
+    const s = await state(page);
+    assert.equal(s.batch.shop, '测试店铺');
+    assert.equal(s.batch.records[0].shop, '测试店铺');
+    assert.equal(s.queries, 1);
+    assert.equal(s.submissions.length, 1);
+  });
+  test('其他后台页已识别店铺，跳转后店铺改变时不查询不回复', 'normal', async (page, context) => {
+    const sourceUrl = 'https://mms.pinduoduo.com/orders/list';
+    await context.route(sourceUrl, route => route.fulfill({ status: 200,
+      contentType: 'text/html; charset=utf-8', body: otherPage('另一测试店铺') }));
+    await enableNavigationInjection(page);
+    await page.goto(sourceUrl);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#batch-n').fill('1');
+    const navigation = page.waitForEvent('framenavigated', { predicate: frame => frame === page.mainFrame() });
+    await panel.locator('#run-once').click();
+    await navigation;
+    await page.waitForFunction(() => document.getElementById('pdd-evaluation-helper-panel')
+      .shadowRoot.getElementById('status').dataset.tone === 'error');
+    assert.equal(page.url(), evaluationUrl);
+    assert.match(await panel.locator('#status').innerText(), /店铺.*不同/);
+    assert.equal((await state(page)).queries, 0);
+    assert.equal((await state(page)).submissions.length, 0);
+  });
+  test('其他后台页启动后目标评价页店铺仍不可识别时不查询不回复', 'normal', async (page, context) => {
+    const sourceUrl = 'https://mms.pinduoduo.com/goods/manage';
+    await context.route(sourceUrl, route => route.fulfill({ status: 200,
+      contentType: 'text/html; charset=utf-8', body: otherPage(null) }));
+    await context.route(evaluationUrl, route => route.fulfill({ status: 200,
+      contentType: 'text/html; charset=utf-8',
+      body: fixture.replace('测试店铺<br>测试店铺：测试子账号<br>退出当前账号', '店铺不可识别') }));
+    await enableNavigationInjection(page);
+    await page.goto(sourceUrl);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#batch-n').fill('1');
+    const navigation = page.waitForEvent('framenavigated', { predicate: frame => frame === page.mainFrame() });
+    await panel.locator('#run-once').click();
+    await navigation;
+    await page.waitForFunction(() => document.getElementById('pdd-evaluation-helper-panel')
+      .shadowRoot.getElementById('status').dataset.tone === 'error');
+    assert.equal(page.url(), evaluationUrl);
+    assert.match(await panel.locator('#status').innerText(), /无法唯一识别当前店铺/);
+    assert.equal((await state(page)).queries, 0);
+    assert.equal((await state(page)).submissions.length, 0);
   });
   test('已在完全相同的目标地址也刷新，当前标签页只加载一次', 'normal', async (page, context) => {
     await enableNavigationInjection(page);
@@ -388,14 +490,20 @@ async function main() {
     assert.match(await panel.locator('#inspection').innerText(), /已停止/);
     assert.match(await panel.locator('#inspection').innerText(), /停止原因/);
   });
-  test('损坏或过期导航标记不启动全部回复', 'normal', async page => {
-    await page.evaluate(() => {
-      sessionStorage.setItem('pdd-evaluation-helper:pending:v1', JSON.stringify({ params: {} }));
-    });
-    await page.reload();
-    await page.addScriptTag({ content: source });
-    assert.equal((await state(page)).queries, 0);
-    assert.equal((await state(page)).submissions.length, 0);
+  test('损坏、过期或缺少检查范围的导航标记不启动全部回复', 'normal', async page => {
+    const valid = { schema: 2, action: 'start-batch', sourceUrl: 'https://mms.pinduoduo.com/goods/manage',
+      at: Date.now(), params: { n: 1, goodsId: '', expectedShop: '' } };
+    for (const pending of [{ params: {} }, { ...valid, params: {} },
+      { ...valid, params: { goodsId: '', expectedShop: '' } },
+      { ...valid, sourceUrl: 'https://example.invalid/' }, { ...valid, at: Date.now() - 180000 }]) {
+      await page.evaluate(pending => {
+        sessionStorage.setItem('pdd-evaluation-helper:pending:v1', JSON.stringify(pending));
+      }, pending);
+      await page.reload();
+      await page.addScriptTag({ content: source });
+      assert.equal((await state(page)).queries, 0);
+      assert.equal((await state(page)).submissions.length, 0);
+    }
   });
 
   const selectedCases = process.env.PDD_TEST_CASE

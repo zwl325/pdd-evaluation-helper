@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDD评价筛选助手（4星、5星、未回复）
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-12.3
+// @version      2026-10-12.4
 // @description  PDD评价筛选、查询、锁定前N条或全部结果，仅对完全匹配的4/5星模板评价提交统一回复。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：Tampermonkey-点击动作DOM定位清单.md（2026-10-12，非实时DOM）。
   const Config = Object.freeze({
-    version: '2026-10-12.3',
+    version: '2026-10-12.4',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -158,15 +158,7 @@
       };
     }
 
-    function supportedPage() {
-      const path = location.pathname.replace(/\/+$/, '');
-      if (path === '/home' || path === '/goods/evaluation/index' ||
-          /(?:^|\/)goods\/evaluation\/index(?:[/?]|$)/.test(location.hash.replace(/^#/, ''))) return true;
-      const state = snapshot();
-      return state.targets.length === Config.targets.length && state.targets.every((target) => target.found);
-    }
-
-    return Object.freeze({ visible, enabled, selected, root, resolve, snapshot, supportedPage });
+    return Object.freeze({ visible, enabled, selected, root, resolve, snapshot });
   })();
 
   const Wait = (() => {
@@ -388,7 +380,7 @@
       if (found.length !== 1) throw new HelperError('DOM_NOT_UNIQUE', `${label}：找到${found.length}个可见目标。`);
       return found[0];
     }
-    function shop() {
+    function shop(optional = false) {
       // 沿用交接文件的页头身份结构；自动推断，不硬编码历史店铺。
       const body = document.body.innerText;
       const end = body.indexOf('后台首页');
@@ -396,6 +388,7 @@
       const names = [...new Set(lines.filter(line =>
         !/[：:]/.test(line) && lines.some(other => other.startsWith(`${line}：`) || other.startsWith(`${line}:`))))];
       if (!lines.includes('退出当前账号') || names.length !== 1) {
+        if (optional) return null;
         throw new HelperError('SHOP_UNVERIFIED', '无法唯一识别当前店铺。需核查页头店铺行、子账号行及登录状态后调整定位。');
       }
       return names[0];
@@ -906,10 +899,11 @@
     }
     function navigate(p) {
       if (navigating || Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
-      const shop = ReviewDOM.shop();
-      if (p.expectedShop && p.expectedShop !== shop) throw new HelperError('SHOP_CHANGED', '启动店铺不符。');
-      Ledger.write(sessionStorage, Config.pendingKey, { schema: 1, action: 'start-batch',
-        params: { ...p, expectedShop: shop }, at: Date.now() });
+      // 其他后台页可能没有评价页的店铺结构；先导航，目标页仍严格识别店铺。
+      const shop = ReviewDOM.shop(true);
+      if (shop && p.expectedShop && p.expectedShop !== shop) throw new HelperError('SHOP_CHANGED', '启动店铺不符。');
+      Ledger.write(sessionStorage, Config.pendingKey, { schema: 2, action: 'start-batch',
+        sourceUrl: location.href, params: { ...p, expectedShop: shop || p.expectedShop }, at: Date.now() });
       navigating = true;
       Actions.update({ busy: true, tone: 'info', message: '正在重新加载评价页，随后自动执行…' });
       try {
@@ -940,14 +934,28 @@
         });
       });
     }
+    function validPending(pending) {
+      if (pending.schema === 1) return typeof pending.params?.expectedShop === 'string' &&
+        Boolean(pending.params.expectedShop.trim());
+      if (pending.schema !== 2 || !pending.params || Array.isArray(pending.params)) return false;
+      const p = pending.params;
+      if (!(p.n === null || Number.isSafeInteger(p.n) && p.n > 0) ||
+          typeof p.goodsId !== 'string' || !/^\d*$/.test(p.goodsId) ||
+          typeof p.expectedShop !== 'string' || typeof pending.sourceUrl !== 'string') return false;
+      try {
+        return new URL(pending.sourceUrl).origin === location.origin;
+      } catch {
+        return false;
+      }
+    }
     async function continueNavigation() {
       try {
         const pending = Ledger.read(sessionStorage, Config.pendingKey, null);
         if (!pending) return;
         sessionStorage.removeItem(Config.pendingKey); // 消费一次，刷新不会重新自动提交。
-        if (pending.schema !== 1 || pending.action !== 'start-batch' || !Number.isFinite(pending.at) ||
+        if (!validPending(pending) || pending.action !== 'start-batch' || !Number.isFinite(pending.at) ||
             Date.now() - pending.at < 0 || Date.now() - pending.at > 120000 ||
-            !pending.params?.expectedShop || !/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) {
+            !/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) {
           throw new HelperError('EXPIRED_START', '跳转任务已过期或页面不符，请手动重新启动。');
         }
         Panel.setParams(pending.params);
@@ -978,9 +986,9 @@
         const selected = state.targets.filter(target => target.selected).length;
         let message = state.error || (state.pageFound
           ? `筛选${state.ready ? '就绪' : '未就绪'}：找到${found}/3项，已选${selected}/3项。`
-          : '未发现评价区域，等待进入评价页。');
-        const problems = state.targets.filter(target => target.error ||
-          (target.found && !target.enabled && !target.selected));
+          : '当前页面可启动；点击“一键运行”自动进入评价页。');
+        const problems = state.pageFound ? state.targets.filter(target => target.error ||
+          (target.found && !target.enabled && !target.selected)) : [];
         if (problems.length) message += `\n${problems.map(target =>
           `${target.label}：${target.error || '不可点击'}`).join('；')}。`;
         if (state.otherSelected.length) message += `\n冲突条件：${state.otherSelected.join('、')}。`;
@@ -1032,7 +1040,8 @@
           #status { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; font-size: 12px; color: #626b7a; }
           #status[data-tone="success"] { color: #207442; }
           #status[data-tone="error"] { color: #b32c22; }
-          #refresh { margin-top: 9px; padding: 4px 9px; font-size: 12px; }
+          .tools { display: flex; gap: 6px; margin-top: 9px; }
+          .tools button { padding: 4px 9px; font-size: 12px; }
           #inspection { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; padding: 8px;
             border-radius: 6px; background: #f6f7fa; font-size: 12px; color: #626b7a; }
           #inspection[data-tone="error"] { color: #b32c22; }
@@ -1041,6 +1050,9 @@
           input { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid #dce0e7; border-radius: 6px; }
           #run-once { width: 100%; margin-top: 12px; background: #e02e24; color: white; border-color: #e02e24; }
           #run-once:hover:enabled { background: #c8241b; }
+          details { margin-top: 9px; font-size: 12px; color: #626b7a; }
+          summary { cursor: pointer; }
+          #reply-copy { margin: 6px 0 0; overflow-wrap: anywhere; }
         </style>
         <section aria-label="PDD评价自动回复">
           <header><strong>PDD 评价自动回复</strong><span class="version">${Config.version}</span></header>
@@ -1051,9 +1063,13 @@
             <input id="batch-goods" type="text" inputmode="numeric" placeholder="留空查询全部商品">
             <button id="run-once" type="button">一键运行</button>
             <p id="status" role="status" aria-live="polite"></p>
-            <button id="refresh" type="button">检查状态</button>
+            <div class="tools">
+              <button id="refresh" type="button">检查状态</button>
+              <button id="export-batch" type="button">导出本机台账</button>
+            </div>
             <p id="inspection" role="status" aria-live="polite"></p>
-            <p class="hint">重新加载评价页后，自动查询并回复模板好评。N留空处理全部结果。</p>
+            <details id="reply-details"><summary>查看统一回复文案</summary><p id="reply-copy"></p></details>
+            <p class="hint">可从后台任意页面启动，自动进入评价页查询并回复。N留空处理全部结果。</p>
           </div>
         </section>`;
       shadow.querySelector('#run-once').addEventListener('click', () => {
@@ -1065,16 +1081,17 @@
         checkedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         render();
       });
+      shadow.querySelector('#export-batch').addEventListener('click', () => {
+        try { Ledger.exportData(); } catch (error) { Actions.update({ tone: 'error', message: error.message }); }
+      });
+      shadow.querySelector('#reply-copy').textContent = Config.replyText;
       document.body.append(host);
       lastRender = '';
     }
 
     function render() {
       mount();
-      const supported = DOM.supportedPage();
-      host.hidden = !supported;
-      host.style.display = supported ? 'block' : 'none';
-      if (!supported) return;
+      // @match和入口已限定商家后台域名；面板不再依赖评价页地址或筛选DOM。
       const status = Actions.status();
       const reading = inspection();
       // 高频mutation不反复更新相同的面板内容。
