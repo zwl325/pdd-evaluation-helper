@@ -21,5 +21,6 @@ jobs:
           node --check pdd-evaluation-filter.user.js
           node --check scripts/sync-metadata.cjs
           node --check tests/filter-helper.spec.cjs
+          node --check tests/batch-workflow.spec.cjs
       - name: Check version and update metadata
         run: node scripts/sync-metadata.cjs --check

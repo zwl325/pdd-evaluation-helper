@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PDD评价筛选助手（4星、5星、未回复）
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-12.1
-// @description  在拼多多商家评价页选择4星、5星、未回复，逐项核验状态，提供独立按钮和一键入口。
+// @version      2026-10-12.2
+// @description  PDD评价筛选、查询、锁定前N条或全部结果，仅对完全匹配的4/5星模板评价提交统一回复。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
 // @supportURL   https://github.com/zwl325/pdd-evaluation-helper/issues
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：Tampermonkey-点击动作DOM定位清单.md（2026-10-12，非实时DOM）。
   const Config = Object.freeze({
-    version: '2026-10-12.1',
+    version: '2026-10-12.2',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -35,6 +35,34 @@
     debounceMs: 150,
     panelId: 'pdd-evaluation-helper-panel',
     apiName: 'PDDEvaluationHelper',
+    evaluationUrl: 'https://mms.pinduoduo.com/goods/evaluation/index?msfrom=mms_sidenav',
+    resultTimeoutMs: 15000,
+    resultStableMs: 800,
+    submissionTimeoutMs: 15000,
+    maxPages: 10000,
+    pendingKey: 'pdd-evaluation-helper:pending:v1',
+    journalKey: 'pdd-evaluation-helper:submissions:v1',
+    batchKey: 'pdd-evaluation-helper:last-batch:v1',
+    lockName: 'pdd-evaluation-helper:batch:v1',
+    replyPattern: /^该用户觉得商品很好，给出了[45]星好评$/,
+    replyText: '小店每天最开心的事莫过于看到亲的好评，亲的好评就像是清泉一样滋润我们的心田，小店会更加的珍惜亲的好评，不断的改进自己，完善自己，力求让小店的服务做得更好，店铺做得更大，也是为了让亲能够更好的买到自己的喜欢的宝贝。你的好评就是对我们最大的肯定和鼓励，希望亲再次关顾我们的店铺，检验小店的进步。',
+    selectors: Object.freeze({
+      form: '#evaluationSearchId form',
+      goods: '#goodsId input',
+      table: '[data-testid="beast-core-table"]',
+      group: '[data-testid="beast-core-table-middle-tbody"]',
+      row: '[data-testid="beast-core-table-body-tr"]',
+      content: '[class*="logic_reviewWrapper"]',
+      time: '[class*="logic_replyTime"]',
+      pagination: '[data-testid="beast-core-pagination"]',
+      activePage: '[class*="PGT_pagerItemActive"], [aria-current="page"]',
+      total: '[class*="PGT_totalText"]',
+      modal: '[data-testid="beast-core-modal-inner"]',
+      modalTitle: '[class*="MDL_header"]',
+      replyInput: 'textarea[data-testid="beast-core-textArea-htmlInput"]',
+      replyButton: 'button[data-tracking-click-viewid="reply_btn"]',
+      loading: '[aria-busy="true"], [data-testid="beast-core-loading"], [class*="LOA_loading"]',
+    }),
   });
 
   if (location.hostname !== Config.host || window.top !== window.self) return;
@@ -222,15 +250,15 @@
       return () => listeners.delete(listener);
     }
 
-    async function run(labels, checkConflicts = false) {
-      if (active) throw new HelperError('BUSY', '已有操作正在执行，请等待完成或点击停止。');
+    async function run(labels, checkConflicts = false, borrowedJob = null) {
+      if (active && active !== borrowedJob) throw new HelperError('BUSY', '已有操作正在执行，请等待完成或点击停止。');
       if (!Array.isArray(labels) || !labels.length ||
           labels.some((label) => !Config.targets.includes(label))) {
         throw new HelperError('INVALID_TARGET', '仅支持4星、5星、未回复。');
       }
 
-      const job = { controller: new AbortController(), url: location.href };
-      const options = {
+      const job = borrowedJob || { controller: new AbortController(), url: location.href };
+      const options = job.options || {
         signal: job.controller.signal,
         guard: () => {
           if (location.href !== job.url) {
@@ -300,6 +328,31 @@
         throw error;
       } finally {
         // 用户暂停只停止未来动作；不撤销已成功完成的筛选。
+        if (!borrowedJob) {
+          active = null;
+          notify({ busy: false });
+        }
+      }
+    }
+
+    async function runTask(execute) {
+      if (active) throw new HelperError('BUSY', '已有操作正在执行。');
+      const job = { controller: new AbortController(), url: location.href };
+      job.options = {
+        signal: job.controller.signal,
+        guard: () => {
+          if (job.controller.signal.aborted) throw new HelperError('CANCELLED', '批次已停止，已提交的回复无法撤销。');
+          if (location.href !== job.url) throw new HelperError('PAGE_CHANGED', '页面地址已改变，批次停止。');
+        },
+      };
+      active = job;
+      notify({ busy: true, tone: 'info', message: '正在启动批次…' });
+      try {
+        return await execute(job);
+      } catch (error) {
+        notify({ tone: 'error', message: error.message });
+        throw error;
+      } finally {
         active = null;
         notify({ busy: false });
       }
@@ -314,6 +367,9 @@
     return Object.freeze({
       select: (label) => run([label]),
       selectAll: () => run(Config.targets, true),
+      selectForBatch: (job) => run(Config.targets, true, job),
+      runTask,
+      update: notify,
       cancel,
       cancelIfPageChanged: () => {
         if (active && location.href !== active.url) cancel();
@@ -321,6 +377,567 @@
       subscribe,
       status: () => ({ ...status }),
     });
+  })();
+
+  const ReviewDOM = (() => {
+    const all = (selector, root = document) => [...root.querySelectorAll(selector)];
+    const text = (element) => (element?.innerText || '').trim();
+    function one(selector, label, root = document, optional = false) {
+      const found = all(selector, root).filter(DOM.visible);
+      if (found.length === 0 && optional) return null;
+      if (found.length !== 1) throw new HelperError('DOM_NOT_UNIQUE', `${label}：找到${found.length}个可见目标。`);
+      return found[0];
+    }
+    function shop() {
+      // 沿用交接文件的页头身份结构；自动推断，不硬编码历史店铺。
+      const body = document.body.innerText;
+      const end = body.indexOf('后台首页');
+      const lines = (end >= 0 ? body.slice(0, end) : '').split('\n').map(line => line.trim()).filter(Boolean);
+      const names = [...new Set(lines.filter(line =>
+        !/[：:]/.test(line) && lines.some(other => other.startsWith(`${line}：`) || other.startsWith(`${line}:`))))];
+      if (!lines.includes('退出当前账号') || names.length !== 1) {
+        throw new HelperError('SHOP_UNVERIFIED', '无法唯一识别当前店铺。需核查页头店铺行、子账号行及登录状态后调整定位。');
+      }
+      return names[0];
+    }
+    function assertShop(expected) {
+      if (shop() !== expected) throw new HelperError('SHOP_CHANGED', '当前店铺已变化，批次停止。');
+    }
+    const form = (optional = false) => one(Config.selectors.form, '评价查询表单', DOM.root() || document, optional);
+    const goods = () => one(Config.selectors.goods, '商品ID输入框', form());
+    function queryButton() {
+      const matches = all('button', form()).filter(element => DOM.visible(element) && text(element) === '查询');
+      if (matches.length !== 1) throw new HelperError('DOM_NOT_UNIQUE', '查询按钮不唯一。');
+      return matches[0];
+    }
+    function setValue(element, value) {
+      if (!DOM.enabled(element) || element.readOnly) throw new HelperError('INPUT_DISABLED', '目标输入框当前不可编辑。');
+      const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(prototype, 'value').set.call(element, value);
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    function filterSignature() {
+      return JSON.stringify({
+        fields: all('input, textarea, select', form()).map(element => ({
+          name: element.name || element.id || element.getAttribute('data-testid') || '',
+          type: element.type,
+          value: element.value,
+          checked: /checkbox|radio/.test(element.type) ? element.checked : undefined,
+        })),
+        selected: all(Config.filterSelector, DOM.root()).filter(DOM.selected).map(text).sort(),
+      });
+    }
+    function identity(group, shopName) {
+      const row = one(Config.selectors.row, '评价正文行', group);
+      const wrapper = one(Config.selectors.content, '评价正文容器', row);
+      const orderValues = [...new Set([...group.innerText.matchAll(/订单编号[：:]\s*([\d-]+)/g)].map(match => match[1]))];
+      const goodsText = text(one('.goods-id', '评价商品ID', group));
+      const goodsId = /^(?:ID|商品ID)\s*[：:]\s*(\d+)$/i.exec(goodsText)?.[1];
+      const time = text(one(Config.selectors.time, '评价时间', wrapper));
+      if (orderValues.length !== 1 || !goodsId || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?$/.test(time)) {
+        throw new HelperError('INCOMPLETE_RECORD', '评价身份或全文不可读取，锁定/回复停止。');
+      }
+      return { shop: shopName, order: orderValues[0], goodsId, time,
+        key: JSON.stringify([shopName, orderValues[0], goodsId, time]) };
+    }
+    function record(group, shopName) {
+      const value = identity(group, shopName);
+      const wrapper = one(Config.selectors.content, '评价正文容器', one(Config.selectors.row, '评价正文行', group));
+      const content = wrapper.firstElementChild?.innerText;
+      if (typeof content !== 'string' || !content.length) throw new HelperError('INCOMPLETE_RECORD', '评价全文不可读取。');
+      return { ...value, content };
+    }
+    function eligible(content) {
+      const match = Config.replyPattern.exec(content);
+      return Boolean(match && match[0] === content); // JS的$也能匹配末尾换行之前；显式检查全文长度。
+    }
+    const table = (optional = false) => one(Config.selectors.table, '评价结果表', DOM.root() || document, optional);
+    const groups = () => all(Config.selectors.group, table()).filter(DOM.visible);
+    function find(recordValue) {
+      assertShop(recordValue.shop);
+      const matches = groups().filter(group => identity(group, recordValue.shop).key === recordValue.key);
+      if (matches.length > 1) throw new HelperError('DUPLICATE_RECORD', '当前页评价身份重复，已停止。');
+      return matches[0] || null;
+    }
+    function page() {
+      const pagination = one(Config.selectors.pagination, '评价分页器', DOM.root() || document, true);
+      if (!pagination) return { number: 1, total: null, next: null, prev: null };
+      const current = one(Config.selectors.activePage, '当前页码', pagination);
+      const number = Number(text(current));
+      const totalText = one(Config.selectors.total, '结果总数', pagination, true);
+      const totalMatch = totalText && /共(?:有)?\s*([\d,]+)\s*条/.exec(text(totalText));
+      const total = totalMatch ? Number(totalMatch[1].replace(/,/g, '')) : null;
+      if (!Number.isSafeInteger(number) || number < 1) throw new HelperError('PAGE_UNREADABLE', '当前页码不可读取。');
+      const arrow = direction => one(`[data-testid="beast-core-pagination-${direction}"]`,
+        `${direction}分页按钮`, pagination, true);
+      return { number, total, next: arrow('next'), prev: arrow('prev') };
+    }
+    const canTurn = (element) => Boolean(element && DOM.enabled(element) && !/PGT_disabled/.test(element.className));
+    function busy() {
+      const root = DOM.root();
+      return !root || !table(true) || all(Config.selectors.loading, root).some(DOM.visible) ||
+        /加载中|正在加载/.test(text(table()));
+    }
+    function fingerprint() {
+      const p = page();
+      return JSON.stringify({ text: table().innerText, page: p.number, total: p.total,
+        next: canTurn(p.next), prev: canTurn(p.prev) });
+    }
+    function empty() {
+      return /暂无(?:数据|评价|相关记录)|没有(?:评价|数据|相关记录)|无查询结果/.test(text(table())) || page().total === 0;
+    }
+    function replyLink(group) {
+      const matches = all('a, button', group).filter(element =>
+        DOM.visible(element) && /^回复[\/／]互动$/.test(text(element)));
+      if (matches.length !== 1 || !DOM.enabled(matches[0])) throw new HelperError('REPLY_LINK_UNAVAILABLE', '对应评价的回复/互动入口不可唯一点击。');
+      return matches[0];
+    }
+    const modals = () => all(Config.selectors.modal).filter(DOM.visible);
+    function modal() {
+      const visible = modals();
+      if (visible.length !== 1 || text(visible[0].querySelector(Config.selectors.modalTitle)) !== '快捷回复') {
+        throw new HelperError('UNEXPECTED_MODAL', '未出现唯一“快捷回复”弹框，可能进入了互动详情，已停止。');
+      }
+      return visible[0];
+    }
+    // 只认独立的精确成功文本，不把包含历史提示的整页/表格当作证据。
+    function successMessages() {
+      return all('div, span, p, [role="status"], [role="alert"]').filter(element =>
+        DOM.visible(element) && /^回复成功[！!。]?$/.test(text(element)) &&
+        !element.closest(Config.selectors.table) && !element.querySelector('input, textarea'));
+    }
+    function replyEcho(rec) {
+      if (!table(true)) return false;
+      const group = find(rec);
+      return group && all('*', group).some(element => DOM.visible(element) &&
+        element.innerText === Config.replyText && !element.closest(Config.selectors.content));
+    }
+    return Object.freeze({ all, text, one, shop, assertShop, form, goods, queryButton, setValue,
+      filterSignature, record, eligible, table, groups, find, page, canTurn, busy, fingerprint, empty,
+      replyLink, modals, modal, successMessages, replyEcho });
+  })();
+
+  const Ledger = (() => {
+    function read(store, key, fallback) {
+      try {
+        const value = store.getItem(key);
+        return value ? JSON.parse(value) : fallback;
+      } catch {
+        throw new HelperError('STORAGE_UNAVAILABLE', '本机台账无法读取；回复操作停止。');
+      }
+    }
+    function write(store, key, value) {
+      try {
+        const text = JSON.stringify(value);
+        store.setItem(key, text);
+        if (store.getItem(key) !== text) throw new Error('Persistence mismatch');
+      } catch {
+        throw new HelperError('STORAGE_UNAVAILABLE', '本机台账无法保存；回复操作停止。');
+      }
+    }
+    function journal() {
+      const data = read(localStorage, Config.journalKey, { schema: 1, entries: {} });
+      if (data.schema !== 1 || !data.entries || typeof data.entries !== 'object' || Array.isArray(data.entries)) {
+        throw new HelperError('INVALID_JOURNAL', '回复台账格式异常，需人工核查。');
+      }
+      if (Object.entries(data.entries).some(([key, entry]) => !entry || entry.key !== key ||
+          typeof entry.shop !== 'string' || !['submitting', 'submitted_unverified', 'confirmed',
+            'not_replied_user_verified'].includes(entry.status))) {
+        throw new HelperError('INVALID_JOURNAL', '回复台账含未知状态或不完整身份，需人工核查。');
+      }
+      return data;
+    }
+    function unresolved(shop) {
+      return Object.values(journal().entries).filter(entry => entry.shop === shop &&
+        ['submitting', 'submitted_unverified'].includes(entry.status));
+    }
+    function submission(rec, status, evidence = '') {
+      const data = journal();
+      const previous = data.entries[rec.key];
+      const history = previous ? [...(previous.history || []),
+        { status: previous.status, at: previous.at, evidence: previous.evidence,
+          manualVerification: previous.manualVerification }] : [];
+      data.entries[rec.key] = { key: rec.key, shop: rec.shop, order: rec.order, goodsId: rec.goodsId,
+        time: rec.time, status, replyText: Config.replyText, at: new Date().toISOString(), evidence, history };
+      write(localStorage, Config.journalKey, data);
+      rec.status = status;
+      rec.evidence = evidence;
+    }
+    const saveBatch = batch => write(sessionStorage, Config.batchKey, batch);
+    const lastBatch = () => read(sessionStorage, Config.batchKey, null);
+    function resolve(key, verdict, note) {
+      if (Actions.status().busy) throw new HelperError('BUSY', '批次执行期间不能修改台账。');
+      if (!['confirmed', 'not_replied_user_verified'].includes(verdict) || !String(note || '').trim()) {
+        throw new HelperError('INVALID_RESOLUTION', '人工核验必须明确结论并填写依据。');
+      }
+      const data = journal();
+      const entry = data.entries[key];
+      if (!entry || !['submitting', 'submitted_unverified'].includes(entry.status)) {
+        throw new HelperError('NO_UNCERTAIN_ENTRY', '没有该身份对应的未知提交。');
+      }
+      ReviewDOM.assertShop(entry.shop);
+      entry.history = [...(entry.history || []),
+        { status: entry.status, at: entry.at, evidence: entry.evidence }];
+      entry.status = verdict;
+      entry.manualVerification = { note: String(note), at: new Date().toISOString() };
+      entry.at = entry.manualVerification.at;
+      write(localStorage, Config.journalKey, data);
+      return { ...entry };
+    }
+    function exportData() {
+      const blob = new Blob([JSON.stringify({ batch: lastBatch(), journal: journal() }, null, 2)],
+        { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `pdd-evaluation-${Date.now()}.json`;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+    return Object.freeze({ read, write, journal, unresolved, submission, saveBatch, lastBatch, resolve, exportData });
+  })();
+
+  const Results = (() => {
+    async function stable(options, description = '等待评价结果稳定') {
+      let last;
+      return Wait.until(() => {
+        if (ReviewDOM.busy()) { last = undefined; return false; }
+        const signature = ReviewDOM.fingerprint();
+        if (signature !== last) { last = signature; return false; }
+        if (!ReviewDOM.groups().length && !ReviewDOM.empty()) return false;
+        return { signature, page: ReviewDOM.page() };
+      }, { ...options, timeoutMs: Config.resultTimeoutMs, stableMs: Config.resultStableMs, description });
+    }
+    async function transition(click, options, targetPage) {
+      const before = ReviewDOM.fingerprint();
+      let activity = false;
+      const table = ReviewDOM.table();
+      const observer = new MutationObserver(records => {
+        if (records.some(record => table.contains(record.target) || record.target === table ||
+            [...record.addedNodes, ...record.removedNodes].some(node =>
+              node.nodeType === 1 && (node.matches?.(Config.selectors.table) || node.contains(table))) ||
+            record.target.closest?.(Config.selectors.pagination) ||
+            record.target.closest?.(Config.selectors.loading))) activity = true;
+      });
+      observer.observe(DOM.root(), { subtree: true, childList: true, characterData: true,
+        attributes: true, attributeFilter: ['class', 'aria-busy', 'style'] });
+      try {
+        options.guard();
+        click();
+        await Wait.until(() => {
+          if (ReviewDOM.busy() || ReviewDOM.fingerprint() !== before) activity = true;
+          const page = ReviewDOM.page();
+          return activity && !ReviewDOM.busy() && (targetPage === undefined || page.number === targetPage);
+        }, { ...options, timeoutMs: Config.resultTimeoutMs, stableMs: 0,
+          description: `等待查询/翻页完成${targetPage ? `（第${targetPage}页）` : ''}` });
+        return await stable(options);
+      } finally {
+        observer.disconnect();
+      }
+    }
+    async function turn(direction, options) {
+      const page = ReviewDOM.page();
+      const element = page[direction];
+      if (!ReviewDOM.canTurn(element)) return false;
+      const expected = page.number + (direction === 'next' ? 1 : -1);
+      await transition(() => {
+        const current = ReviewDOM.page();
+        if (current.number !== page.number || !ReviewDOM.canTurn(current[direction])) {
+          throw new HelperError('PAGE_CHANGED', '翻页前分页状态变化，已停止。');
+        }
+        current[direction].click();
+      }, options, expected);
+      return true;
+    }
+    async function first(options) {
+      let count = 0;
+      while (ReviewDOM.page().number > 1) {
+        if (++count > Config.maxPages || !await turn('prev', options)) {
+          throw new HelperError('CANNOT_RETURN_FIRST', '不能返回查询第一页，已停止。');
+        }
+      }
+    }
+    async function freeze(batch, options) {
+      await first(options);
+      const keys = new Set();
+      const initialTotal = ReviewDOM.page().total;
+      const limit = batch.params.n ?? Infinity;
+      batch.initialTotal = initialTotal;
+      batch.maxCapturedPage = 1;
+      while (batch.records.length < limit) {
+        options.guard();
+        const page = ReviewDOM.page();
+        if (page.number > Config.maxPages || page.total !== initialTotal) {
+          throw new HelperError('RESULTS_CHANGED', '收集期间总数变化或分页超出保护上限，未开始回复。');
+        }
+        const groups = ReviewDOM.groups();
+        const take = Math.min(groups.length, limit - batch.records.length);
+        for (const group of groups.slice(0, take)) {
+          const rec = ReviewDOM.record(group, batch.shop);
+          if (keys.has(rec.key)) throw new HelperError('DUPLICATE_RECORD', '锁定范围内存在重复评价身份，未开始回复。');
+          if (batch.params.goodsId && rec.goodsId !== batch.params.goodsId) {
+            throw new HelperError('GOODS_FILTER_MISMATCH', '查询结果包含其他商品，未开始回复。');
+          }
+          keys.add(rec.key);
+          batch.records.push({ ...rec, rank: batch.records.length + 1, capturedPage: page.number, status: 'pending' });
+        }
+        batch.maxCapturedPage = page.number;
+        Ledger.saveBatch(batch);
+        Actions.update({ message: `正在锁定查询结果：${batch.records.length}条，第${page.number}页。` });
+        if (batch.records.length >= limit || !ReviewDOM.canTurn(page.next)) break;
+        if (!groups.length) throw new HelperError('INCONSISTENT_EMPTY_PAGE', '空页仍可翻页，分页结构需核查。');
+        await turn('next', options);
+      }
+      const expected = initialTotal === null ? null : Math.min(limit, initialTotal);
+      if (expected !== null && batch.records.length !== expected) {
+        throw new HelperError('INCOMPLETE_SCOPE', `应锁定${expected}条，实际${batch.records.length}条；未开始回复。`);
+      }
+      batch.frozenAt = new Date().toISOString();
+      Ledger.saveBatch(batch);
+      await first(options);
+      // 冻结是跨页读取；提交前再校验原始前缀，发现采集期间重排则不执行回复。
+      for (let number = 1; number <= batch.maxCapturedPage; number++) {
+        options.guard();
+        if (ReviewDOM.page().total !== initialTotal) {
+          throw new HelperError('RESULTS_CHANGED', '冻结核查时结果总数变化，未开始回复。');
+        }
+        const expectedPage = batch.records.filter(rec => rec.capturedPage === number);
+        const currentGroups = ReviewDOM.groups().slice(0, expectedPage.length);
+        const current = currentGroups.map(group => ReviewDOM.record(group, batch.shop));
+        if (current.length !== expectedPage.length || current.some((rec, index) =>
+          rec.key !== expectedPage[index].key || rec.content !== expectedPage[index].content)) {
+          throw new HelperError('RESULTS_REORDERED', '锁定过程中原始前缀变化，未开始回复；请重新查询。');
+        }
+        if (number < batch.maxCapturedPage && !await turn('next', options)) {
+          throw new HelperError('INCOMPLETE_SCOPE', '冻结核查不能到达原始页。');
+        }
+      }
+      await first(options);
+    }
+    async function locate(rec, batch, options) {
+      // 只在最初捕获的页范围内核对身份，绝不扩展N或改拿当前第N条。
+      await stable(options);
+      await first(options);
+      while (true) {
+        options.guard();
+        const group = ReviewDOM.find(rec);
+        if (group) return group;
+        const page = ReviewDOM.page();
+        if (page.number >= batch.maxCapturedPage || !ReviewDOM.canTurn(page.next)) return null;
+        await turn('next', options);
+      }
+    }
+    return Object.freeze({ stable, transition, freeze, locate });
+  })();
+
+  const Replies = (() => {
+    async function submit(rec, batch, options) {
+      options.guard();
+      let group = ReviewDOM.find(rec);
+      if (!group || ReviewDOM.record(group, batch.shop).content !== rec.content) {
+        throw new HelperError('RECORD_CHANGED', '回复前身份或正文变化，已停止。');
+      }
+      if (ReviewDOM.modals().length) throw new HelperError('EXISTING_MODAL', '页面已有弹框，请先人工核查。');
+      const link = ReviewDOM.replyLink(group);
+      link.scrollIntoView({ block: 'center', behavior: 'instant' });
+      link.click();
+      await Wait.until(() => {
+        if (!ReviewDOM.modals().length) return false;
+        return ReviewDOM.modal();
+      }, { ...options, description: '等待快捷回复弹框' });
+      const input = ReviewDOM.one(Config.selectors.replyInput, '回复输入框', ReviewDOM.modal());
+      if (input.value) throw new HelperError('EXISTING_REPLY_TEXT', '弹框已有文字，可能存在历史互动；未覆盖或提交。');
+      if (Config.replyText.length > 200 || input.maxLength > 0 && input.maxLength < Config.replyText.length) {
+        throw new HelperError('REPLY_TOO_LONG', '统一回复超过输入限制。');
+      }
+      ReviewDOM.setValue(input, Config.replyText);
+      await Wait.until(() => {
+        const modal = ReviewDOM.modal();
+        const current = ReviewDOM.one(Config.selectors.replyInput, '回复输入框', modal);
+        const button = ReviewDOM.one(Config.selectors.replyButton, '提交回复按钮', modal);
+        return current.value === Config.replyText && DOM.enabled(button);
+      }, { ...options, description: '核验完整回复文案及提交按钮' });
+      await Wait.until(() => !ReviewDOM.successMessages().length,
+        { ...options, description: '等待上一条成功提示消失' });
+
+      // 观察文本变化和新节点。仅在本次click之后读取证据，排除上一条提示。
+      let armed = false;
+      let successEvidence = '';
+      const evidenceObserver = new MutationObserver(() => {
+        if (armed && ReviewDOM.successMessages().length) successEvidence = 'fresh_reply_success';
+      });
+      evidenceObserver.observe(document.body, { subtree: true, childList: true, characterData: true,
+        attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
+      let submitted = false;
+      try {
+        options.guard();
+        group = ReviewDOM.find(rec);
+        if (!group || ReviewDOM.record(group, batch.shop).content !== rec.content ||
+            !ReviewDOM.eligible(rec.content)) throw new HelperError('RECORD_CHANGED', '提交前评价身份或全文不一致。');
+        const modal = ReviewDOM.modal();
+        const current = ReviewDOM.one(Config.selectors.replyInput, '回复输入框', modal);
+        const button = ReviewDOM.one(Config.selectors.replyButton, '提交回复按钮', modal);
+        if (current.value !== Config.replyText || !DOM.enabled(button)) {
+          throw new HelperError('REPLY_NOT_READY', '提交前文案或按钮状态改变。');
+        }
+        Ledger.submission(rec, 'submitting');
+        Ledger.saveBatch(batch);
+        submitted = true;
+        armed = true;
+        button.click(); // 持久化状态后仅提交一次；未知结果禁止自动重发。
+        await Wait.until(() => {
+          if (ReviewDOM.successMessages().length) successEvidence = 'fresh_reply_success';
+          if (ReviewDOM.replyEcho(rec)) successEvidence = 'record_reply_echo';
+          return (successEvidence === 'record_reply_echo' ||
+            successEvidence && !ReviewDOM.modals().length) ? successEvidence : false;
+        }, { ...options, timeoutMs: Config.submissionTimeoutMs, stableMs: 0,
+          description: '等待本次回复成功证据' });
+        Ledger.submission(rec, 'confirmed', successEvidence);
+        Ledger.saveBatch(batch);
+        await Wait.until(() => !ReviewDOM.modals().length,
+          { ...options, description: '等待已成功回复的弹框关闭' });
+        await Results.stable(options);
+      } catch (error) {
+        if (submitted && rec.status !== 'confirmed') {
+          Ledger.submission(rec, 'submitted_unverified', error.code || error.message);
+          Ledger.saveBatch(batch);
+          throw new HelperError('SUBMITTED_UNVERIFIED', `订单${rec.order}已发出一次提交，但结果不明。批次停止，禁止自动重试；请人工核查并导出台账。`);
+        }
+        throw error;
+      } finally {
+        evidenceObserver.disconnect();
+      }
+    }
+    return Object.freeze({ submit });
+  })();
+
+  const Workflow = (() => {
+    function params(value = {}) {
+      const rawN = value.n;
+      const absentN = rawN === undefined || rawN === null || rawN === '';
+      const n = absentN ? null : Number(rawN);
+      if (!absentN && (!/^[1-9]\d*$/.test(String(rawN)) || !Number.isSafeInteger(n))) {
+        throw new HelperError('INVALID_N', 'N必须是正整数，留空表示全部查询结果。');
+      }
+      const goodsId = value.goodsId === undefined || value.goodsId === null ? '' : String(value.goodsId).trim();
+      if (goodsId && !/^\d+$/.test(goodsId)) throw new HelperError('INVALID_GOODS_ID', '商品ID必须是完整数字，或留空。');
+      return { n, goodsId, expectedShop: String(value.expectedShop || '').trim() };
+    }
+    async function execute(p, job) {
+      const options = job.options;
+      await Wait.until(() => Boolean(DOM.root() && DOM.snapshot().ready && ReviewDOM.form(true) && ReviewDOM.table(true)),
+        { ...options, timeoutMs: Config.resultTimeoutMs, description: '等待评价页加载' });
+      const shop = ReviewDOM.shop();
+      if (p.expectedShop && shop !== p.expectedShop) throw new HelperError('SHOP_CHANGED', '当前店铺与启动时指定的店铺不同。');
+      const unresolved = Ledger.unresolved(shop);
+      if (unresolved.length) throw new HelperError('UNRESOLVED_HISTORY', '该店铺存在未知提交，需先人工核验历史记录，不能启动新批次。');
+      const initialGuard = options.guard;
+      let filterSignature;
+      options.guard = () => {
+        initialGuard();
+        ReviewDOM.assertShop(shop);
+        if (filterSignature && ReviewDOM.filterSignature() !== filterSignature) {
+          throw new HelperError('FILTER_CHANGED', '批次期间查询条件改变，已停止。');
+        }
+      };
+      const batch = { id: crypto.randomUUID(), version: Config.version, startedAt: new Date().toISOString(),
+        shop, params: p, phase: 'querying', records: [] };
+      Ledger.saveBatch(batch);
+      try {
+        await Actions.selectForBatch(job);
+        options.guard();
+        // 未指定也写入空值，清除页面残留ID；绝不静默继承旧查询条件。
+        if (ReviewDOM.goods().value !== p.goodsId) ReviewDOM.setValue(ReviewDOM.goods(), p.goodsId);
+        await Wait.until(() => ReviewDOM.goods().value === p.goodsId,
+          { ...options, description: '核验商品ID输入条件' });
+        const residuals = ReviewDOM.all('input, textarea', ReviewDOM.form()).filter(element =>
+          DOM.visible(element) && element !== ReviewDOM.goods() && !element.readOnly &&
+          !['checkbox', 'radio', 'button', 'submit', 'hidden'].includes(element.type) && element.value.trim());
+        if (residuals.length) throw new HelperError('RESIDUAL_FILTER', '存在未指定的订单号/关键词等输入，请清空后再启动。');
+        if (ReviewDOM.modals().length) throw new HelperError('EXISTING_MODAL', '页面已有弹框，查询前停止。');
+        filterSignature = ReviewDOM.filterSignature();
+        batch.filters = JSON.parse(filterSignature);
+        Actions.update({ message: `店铺：${shop}。查询商品${p.goodsId || '全部'}；检查${p.n ?? '全部'}条。` });
+        await Results.transition(() => {
+          const button = ReviewDOM.queryButton();
+          if (!DOM.enabled(button)) throw new HelperError('QUERY_DISABLED', '查询按钮不可点击。');
+          button.click();
+        }, options, 1);
+        batch.phase = 'freezing';
+        await Results.freeze(batch, options);
+        batch.phase = 'replying';
+        Ledger.saveBatch(batch);
+        for (const rec of batch.records) {
+          options.guard();
+          Actions.update({ message: `锁定${batch.records.length}条；正在检查第${rec.rank}条，订单${rec.order}。` });
+          const prior = Ledger.journal().entries[rec.key];
+          if (prior?.status === 'confirmed') {
+            rec.status = 'skipped_previously_confirmed';
+          } else {
+            const group = await Results.locate(rec, batch, options);
+            if (!group) rec.status = 'skipped_missing_locked_record';
+            else {
+              const current = ReviewDOM.record(group, shop);
+              if (current.content !== rec.content) throw new HelperError('RECORD_CHANGED', '锁定记录正文已变化，停止而不替换记录。');
+              // 完全匹配：不trim、不提取局部、不将手写评价视为模板。
+              if (!ReviewDOM.eligible(current.content)) rec.status = 'skipped_non_template';
+              else await Replies.submit(rec, batch, options);
+            }
+          }
+          Ledger.saveBatch(batch);
+        }
+        const replied = batch.records.filter(rec => rec.status === 'confirmed').length;
+        const skipped = batch.records.filter(rec => rec.status.startsWith('skipped_')).length;
+        batch.phase = 'completed';
+        batch.completedAt = new Date().toISOString();
+        batch.summary = { checked: batch.records.length, replied, skipped };
+        Ledger.saveBatch(batch);
+        Actions.update({ tone: 'success',
+          message: `批次完成：锁定检查${batch.records.length}条，确认回复${replied}条，跳过${skipped}条。${p.n ? `N=${p.n}，未补位。` : '已遍历全部查询结果。'}` });
+        return { ok: true, ...batch.summary, batch };
+      } catch (error) {
+        batch.phase = 'stopped';
+        batch.error = { code: error.code || error.name, message: error.message };
+        Ledger.saveBatch(batch);
+        throw error;
+      }
+    }
+    async function start(value) {
+      const p = params(value);
+      if (Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
+      if (!/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) {
+        const shop = ReviewDOM.shop();
+        if (p.expectedShop && p.expectedShop !== shop) throw new HelperError('SHOP_CHANGED', '启动店铺不符。');
+        Ledger.write(sessionStorage, Config.pendingKey, { schema: 1, action: 'start-batch',
+          params: { ...p, expectedShop: shop }, at: Date.now() });
+        location.assign(Config.evaluationUrl);
+        return { navigating: true };
+      }
+      return Actions.runTask(async job => {
+        if (!navigator.locks?.request) throw new HelperError('LOCK_UNAVAILABLE', '当前浏览器不支持批次互斥锁，未开始提交。');
+        return navigator.locks.request(Config.lockName, { ifAvailable: true }, async lock => {
+          if (!lock) throw new HelperError('OTHER_TAB_BUSY', '另一个后台标签页正在执行批次，请等待完成。');
+          return execute(p, job);
+        });
+      });
+    }
+    async function continueNavigation() {
+      try {
+        const pending = Ledger.read(sessionStorage, Config.pendingKey, null);
+        if (!pending) return;
+        sessionStorage.removeItem(Config.pendingKey); // 消费一次，刷新不会重新自动提交。
+        if (pending.schema !== 1 || pending.action !== 'start-batch' || !Number.isFinite(pending.at) ||
+            Date.now() - pending.at < 0 || Date.now() - pending.at > 120000 ||
+            !pending.params?.expectedShop || !/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) {
+          throw new HelperError('EXPIRED_START', '跳转任务已过期或页面不符，请手动重新启动。');
+        }
+        await start(pending.params);
+      } catch (error) {
+        Actions.update({ tone: 'error', message: error.message });
+      }
+    }
+    return Object.freeze({ start, continueNavigation });
   })();
 
   const Panel = (() => {
@@ -350,7 +967,7 @@
           button:focus-visible { outline: 2px solid #e02e24; outline-offset: 2px; }
           button:disabled { opacity: .45; cursor: not-allowed; }
           #collapse { border: 0; background: transparent; padding: 0 4px; }
-          #body { padding: 12px 14px 14px; }
+          #body { padding: 12px 14px 14px; max-height: calc(100vh - 120px); overflow: auto; }
           [hidden] { display: none !important; }
           #state { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 10px; }
           .badge { text-align: center; background: #f1f3f7; color: #5f6878; border-radius: 6px; padding: 5px 2px; }
@@ -365,6 +982,13 @@
           #status[data-tone="error"] { color: #b32c22; }
           #others { margin-top: 8px; color: #a96510; font-size: 12px; }
           .hint { color: #737c8c; margin: 9px 0 0; font-size: 11px; }
+          .batch { border-top: 1px solid #e3e5eb; margin-top: 12px; padding-top: 10px; }
+          .batch label { display: block; font-size: 12px; margin-top: 6px; }
+          input { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid #dce0e7; border-radius: 6px; }
+          #start-batch { width: 100%; margin-top: 10px; background: #e02e24; color: white; border-color: #e02e24; }
+          #start-batch:hover:enabled { background: #c8241b; }
+          details { font-size: 11px; color: #626b7a; margin-top: 8px; }
+          #reply-copy { overflow-wrap: anywhere; margin-top: 5px; }
         </style>
         <section aria-label="PDD评价筛选助手">
           <header><strong>PDD 评价筛选助手</strong>
@@ -387,7 +1011,17 @@
             </div>
             <p id="status" role="status" aria-live="polite"></p>
             <div id="others" hidden></div>
-            <p class="hint">选择后可手动点击页面“查询”。再次执行会跳过已选项。</p>
+            <div class="batch">
+              <strong>查询与模板评价回复</strong>
+              <label for="batch-n">检查数量 N（留空＝全部结果）</label>
+              <input id="batch-n" type="text" inputmode="numeric" placeholder="例如 5；N不是回复数量">
+              <label for="batch-goods">商品 ID（可选，留空会清除旧值）</label>
+              <input id="batch-goods" type="text" inputmode="numeric" placeholder="仅填写明确指定的商品 ID">
+              <button id="start-batch" type="button">开始查询并自动回复</button>
+              <button id="export-batch" type="button" style="margin-top:8px">导出本机台账</button>
+              <details><summary>查看统一回复文案</summary><div id="reply-copy"></div></details>
+              <p class="hint">启动后自动进入评价页、查询、锁定范围并提交符合模板的回复。日期沿用页面条件。N留空会遍历全部结果。</p>
+            </div>
           </div>
         </section>`;
       for (const button of shadow.querySelectorAll('[data-select]')) {
@@ -401,6 +1035,15 @@
       });
       shadow.querySelector('#refresh').addEventListener('click', render);
       shadow.querySelector('#stop').addEventListener('click', Actions.cancel);
+      shadow.querySelector('#reply-copy').textContent = Config.replyText;
+      shadow.querySelector('#start-batch').addEventListener('click', () => {
+        void Workflow.start({ n: shadow.querySelector('#batch-n').value,
+          goodsId: shadow.querySelector('#batch-goods').value })
+          .catch(error => Actions.update({ tone: 'error', message: error.message }));
+      });
+      shadow.querySelector('#export-batch').addEventListener('click', () => {
+        try { Ledger.exportData(); } catch (error) { Actions.update({ tone: 'error', message: error.message }); }
+      });
       shadow.querySelector('#collapse').addEventListener('click', () => {
         const body = shadow.querySelector('#body');
         const button = shadow.querySelector('#collapse');
@@ -439,6 +1082,9 @@
       }
       shadow.querySelector('#all').disabled = status.busy || !state.ready;
       shadow.querySelector('#stop').disabled = !status.busy;
+      shadow.querySelector('#start-batch').disabled = status.busy;
+      shadow.querySelector('#batch-n').disabled = status.busy;
+      shadow.querySelector('#batch-goods').disabled = status.busy;
       const feedback = shadow.querySelector('#status');
       const unavailable = state.error || state.targets
         .filter((target) => !target.found || !target.enabled && !target.selected)
@@ -535,6 +1181,10 @@
     value: Object.freeze({
       version: Config.version,
       readState: DOM.snapshot,
+      startBatch: Workflow.start,
+      readBatch: Ledger.lastBatch,
+      readSubmissionJournal: Ledger.journal,
+      resolveSubmission: Ledger.resolve,
       select: Actions.select,
       selectAll: Actions.selectAll,
       cancel: Actions.cancel,
@@ -542,4 +1192,5 @@
   });
 
   App.start();
+  void Workflow.continueNavigation();
 })();

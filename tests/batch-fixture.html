@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>评价回复流程离线夹具</title>
+<style>
+  body { font: 15px/1.65 system-ui, "Microsoft YaHei"; margin: 24px; background: #f5f6fa; }
+  #shop-header, #mf-mms-goods-container { background: white; padding: 12px; margin-bottom: 12px; max-width: 700px; }
+  .evaluation_search_btn { display: inline-block; padding: 4px 12px; margin: 4px; border: 1px solid #ddd; cursor: pointer; }
+  .evaluation_search_btn_checked { border-color: #e02e24; color: #e02e24; }
+  [data-testid="beast-core-table-middle-tbody"] { padding: 10px; border-bottom: 1px solid #ddd; }
+  li { display: inline-block; margin: 5px; padding: 3px 8px; cursor: pointer; }
+  .PGT_disabled { color: #999; }
+  [data-testid="beast-core-modal-inner"] { position: fixed; top: 100px; left: 200px; width: 440px;
+    padding: 20px; background: white; border: 1px solid #aaa; z-index: 10; }
+  textarea { width: 100%; height: 120px; }
+  .toast { background: #e8f9ee; padding: 6px; }
+  .logic_reviewWrapper_x > div { white-space: pre-wrap; }
+</style>
+<div id="shop-header">测试店铺<br>测试店铺：测试子账号<br>退出当前账号</div>
+<div>后台首页</div>
+<div id="mf-mms-goods-container">
+  <h2>商品评价 · 合成测试数据</h2>
+  <div id="evaluationSearchId"><form>
+    <div id="goodsId"><label>商品ID <input value="9009"></label></div>
+    <label>订单 <input id="order-input"></label>
+    <div id="filters">
+      <div class="evaluation_search_btn">4星</div><div class="evaluation_search_btn">5星</div>
+      <div class="evaluation_search_btn">未回复</div>
+      <div class="evaluation_search_btn evaluation_search_btn_checked">近90天</div>
+    </div>
+    <button type="button" id="query">查询</button>
+  </form></div>
+  <div id="results"></div>
+</div>
+<span id="toast" class="toast"></span>
+<script>
+  'use strict';
+  const mode = new URLSearchParams(location.search).get('mode') || 'normal';
+  const template = star => `该用户觉得商品很好，给出了${star}星好评`;
+  const baseRecords = [template(5), '很好用，下次还来', template(4), `${template(5)} `, template(5), '该用户觉得商品较好，给出了5星好评'];
+  window.sim = {
+    records: baseRecords.map((content, i) => ({ order: `990000-00000000${i + 1}`, goodsId: i < 2 ? '9001' : '9002',
+      time: `2026-10-12 10:00:0${i}`, content, replied: false })),
+    submissions: [], opens: [], queries: 0, page: 1, pageSize: 2, filterGoods: '',
+    goodsEvents: [], filterClicks: [], visited: [],
+  };
+  if (mode === 'duplicate') window.sim.records[2] = { ...window.sim.records[0] };
+  if (mode === 'bad-time') window.sim.records[0].time = '日期未知';
+  if (mode === 'newline') window.sim.records[0].content += '\n';
+  if (mode === 'residual') document.getElementById('order-input').value = '旧订单';
+  if (mode === 'bad-shop') document.getElementById('shop-header').innerHTML = '店铺不可识别';
+  const available = () => window.sim.records.filter(rec => !rec.replied &&
+    (!window.sim.filterGoods || rec.goodsId === window.sim.filterGoods));
+  function render() {
+    const s = window.sim;
+    const records = available();
+    const pages = Math.max(1, Math.ceil(records.length / s.pageSize));
+    s.page = Math.min(s.page, pages);
+    const pageRecords = records.slice((s.page - 1) * s.pageSize, s.page * s.pageSize);
+    const table = pageRecords.map(rec => `
+      <div data-testid="beast-core-table-middle-tbody">
+        <div>订单编号：${rec.order}</div><span class="goods-id">ID: ${rec.goodsId}</span>
+        <div data-testid="beast-core-table-body-tr">
+          <div class="logic_reviewWrapper_x"><div>${rec.content}</div><span class="logic_replyTime_x">${rec.time}</span></div>
+        </div>
+        ${rec.replyText ? `<div class="logic_replyWrapper_x">${rec.replyText}</div>` : ''}
+        <a href="#" data-order="${rec.order}">回复／互动</a>
+      </div>`).join('') || '<div>暂无数据</div>';
+    const pagesHtml = Array.from({ length: pages }, (_, i) =>
+      `<li class="PGT_pagerItem ${i + 1 === s.page ? 'PGT_pagerItemActive' : ''}">${i + 1}</li>`).join('');
+    document.getElementById('results').innerHTML = `
+      <div data-testid="beast-core-table">${table}</div>
+      <ul data-testid="beast-core-pagination">
+        <li class="PGT_totalText">共有 ${records.length} 条</li>
+        <li data-testid="beast-core-pagination-prev" class="${s.page === 1 ? 'PGT_disabled' : ''}">上一页</li>
+        ${pagesHtml}
+        <li data-testid="beast-core-pagination-next" class="${s.page >= pages ? 'PGT_disabled' : ''}">下一页</li>
+      </ul>`;
+    s.visited.push({ page: s.page, beforeSubmission: s.submissions.length === 0 });
+  }
+  function load(action) {
+    const table = document.querySelector('[data-testid="beast-core-table"]');
+    table.setAttribute('aria-busy', 'true');
+    if (mode === 'unmount') table.remove();
+    setTimeout(() => { action(); render(); }, 30);
+  }
+  render();
+  document.querySelector('#goodsId input').addEventListener('input', event => {
+    window.sim.goodsEvents.push(event.target.value);
+    if (mode === 'goods-rejected') event.target.value = '9009';
+  });
+  document.querySelectorAll('.evaluation_search_btn').forEach(button => button.addEventListener('click', () => {
+    window.sim.filterClicks.push(button.innerText);
+    button.classList.toggle('evaluation_search_btn_checked');
+  }));
+  document.getElementById('query').addEventListener('click', () => {
+    window.sim.queries++;
+    if (mode === 'query-noop') return;
+    load(() => {
+      window.sim.page = 1;
+      window.sim.filterGoods = document.querySelector('#goodsId input').value;
+      if (mode === 'empty') window.sim.records = [];
+    });
+  });
+  function openReply(order) {
+    const rec = window.sim.records.find(rec => rec.order === order);
+    window.sim.opens.push(order);
+    if (mode === 'shop-change') document.getElementById('shop-header').innerHTML =
+      '别的测试店铺<br>别的测试店铺：子账号<br>退出当前账号';
+    if (mode === 'filter-change') document.getElementById('order-input').value = '意外变化';
+    if (mode === 'content-change') {
+      rec.content = '用户补充的新评价';
+      render();
+    }
+    if (mode === 'stale-toast') document.getElementById('toast').textContent = '回复成功！';
+    const modal = document.createElement('div');
+    modal.setAttribute('data-testid', 'beast-core-modal-inner');
+    modal.innerHTML = `<div class="MDL_header_x">${mode === 'wrong-modal' ? '互动详情' : '快捷回复'}</div>
+      <textarea data-testid="beast-core-textArea-htmlInput" maxlength="200"></textarea>
+      <button data-tracking-click-viewid="reply_btn">回复</button><button class="cancel">取消</button>`;
+    document.body.append(modal);
+    const input = modal.querySelector('textarea');
+    let receivedInput = '';
+    if (mode === 'existing-text') input.value = '旧互动';
+    input.addEventListener('input', event => {
+      receivedInput = event.target.value;
+      if (mode === 'text-rejected') event.target.value = '组件拒绝';
+    });
+    modal.querySelector('.cancel').addEventListener('click', () => modal.remove());
+    modal.querySelector('[data-tracking-click-viewid="reply_btn"]').addEventListener('click', () => {
+      window.sim.submissions.push({ order, value: input.value, receivedInput });
+      setTimeout(() => {
+        modal.remove();
+        if (['unknown', 'stale-toast', 'cancel-after-submit'].includes(mode)) return;
+        if (mode === 'echo') rec.replyText = input.value;
+        else rec.replied = true;
+        if (mode === 'missing-locked') window.sim.records = window.sim.records.filter(candidate =>
+          candidate.order !== '990000-000000003');
+        render(); // 未回复列表缩减并向前移动。
+        if (mode !== 'echo') {
+          // 复用已有span并改变文本，不新增成功节点。
+          document.getElementById('toast').textContent = '回复成功！';
+          setTimeout(() => { document.getElementById('toast').textContent = ''; }, 80);
+        }
+      }, 25);
+    });
+    if (mode === 'stale-toast') setTimeout(() => { document.getElementById('toast').textContent = ''; }, 100);
+  }
+  document.getElementById('results').addEventListener('click', event => {
+    const order = event.target.getAttribute('data-order');
+    if (order) { event.preventDefault(); openReply(order); return; }
+    const direction = event.target.getAttribute('data-testid');
+    if (direction === 'beast-core-pagination-next') load(() => {
+      window.sim.page++;
+      if (mode === 'reorder-freeze' && window.sim.submissions.length === 0 && window.sim.page === 2) {
+        [window.sim.records[0], window.sim.records[1]] = [window.sim.records[1], window.sim.records[0]];
+      }
+    });
+    if (direction === 'beast-core-pagination-prev') load(() => { window.sim.page--; });
+  });
+</script>
+</html>
