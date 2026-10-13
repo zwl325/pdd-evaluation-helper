@@ -351,6 +351,80 @@ async function main() {
     assert.equal((await page.evaluate(() => window.pending)).code, 'SUBMITTED_UNVERIFIED');
     assert.equal((await state(page)).submissions.length, 1);
   });
+  test('急停查询等待立即结束批次，没有回复或提交台账', 'query-noop', async page => {
+    await page.evaluate(() => {
+      window.pending = window.PDDEvaluationHelper.startBatch({ n: 3 }).catch(error => ({ code: error.code }));
+    });
+    await page.waitForFunction(() => window.sim.queries === 1);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#stop').click();
+    assert.equal((await page.evaluate(() => window.pending)).code, 'CANCELLED');
+    const s = await state(page);
+    assert.equal(s.batch.phase, 'stopped');
+    assert.equal(s.batch.error.code, 'CANCELLED');
+    assert.equal(s.queries, 1);
+    assert.equal(s.opens.length, 0);
+    assert.equal(s.submissions.length, 0);
+    assert.equal(await panel.locator('#run-once').isDisabled(), false);
+    assert.equal(await panel.locator('#status').getAttribute('data-tone'), 'info');
+    assert.equal(await page.evaluate(() => Object.keys(window.PDDEvaluationHelper.readSubmissionJournal().entries).length), 0);
+  });
+  test('急停锁定期间的翻页等待，未锁定完毕不开始回复', 'normal', async page => {
+    await page.evaluate(() => {
+      document.getElementById('results').addEventListener('click', event => {
+        if (event.target.getAttribute('data-testid') !== 'beast-core-pagination-next') return;
+        event.stopImmediatePropagation();
+        document.querySelector('[data-testid="beast-core-table"]').setAttribute('aria-busy', 'true');
+        window.freezePaused = true;
+      }, true);
+      window.pending = window.PDDEvaluationHelper.startBatch({ n: 3 }).catch(error => ({ code: error.code }));
+    });
+    await page.waitForFunction(() => window.freezePaused);
+    await page.locator('#pdd-evaluation-helper-panel').locator('#stop').click();
+    assert.equal((await page.evaluate(() => window.pending)).code, 'CANCELLED');
+    const s = await state(page);
+    assert.equal(s.batch.records.length, 2);
+    assert.equal(s.batch.phase, 'stopped');
+    assert.equal(s.opens.length, 0);
+    assert.equal(s.submissions.length, 0);
+  });
+  test('急停已填写但尚未提交的回复，保留草稿且零提交', 'normal', async page => {
+    await page.evaluate(() => {
+      document.body.addEventListener('input', event => {
+        if (event.target.tagName === 'TEXTAREA') {
+          document.querySelector('[data-tracking-click-viewid="reply_btn"]').disabled = true;
+        }
+      }, true);
+      window.pending = window.PDDEvaluationHelper.startBatch({ n: 3 }).catch(error => ({ code: error.code }));
+    });
+    await page.waitForFunction(() => document.querySelector('textarea')?.value.length > 100);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#stop').click();
+    assert.equal((await page.evaluate(() => window.pending)).code, 'CANCELLED');
+    assert.equal(await page.locator('textarea').inputValue(), replyText);
+    const s = await state(page);
+    assert.equal(s.opens.length, 1);
+    assert.equal(s.submissions.length, 0);
+    assert.equal(s.batch.phase, 'stopped');
+    assert.equal(await page.evaluate(() => Object.keys(window.PDDEvaluationHelper.readSubmissionJournal().entries).length), 0);
+  });
+  test('急停按钮在提交已发出后保留未知台账并阻止重发', 'cancel-after-submit', async page => {
+    await page.evaluate(() => {
+      window.pending = window.PDDEvaluationHelper.startBatch({ n: 3 }).catch(error => ({ code: error.code }));
+    });
+    await page.waitForFunction(() => window.sim.submissions.length === 1);
+    await page.locator('#pdd-evaluation-helper-panel').locator('#stop').click();
+    assert.equal((await page.evaluate(() => window.pending)).code, 'SUBMITTED_UNVERIFIED');
+    const s = await state(page);
+    assert.equal(s.submissions.length, 1);
+    assert.equal(s.batch.phase, 'stopped');
+    assert.equal(s.batch.records[0].status, 'submitted_unverified');
+    const entries = await page.evaluate(() => Object.values(window.PDDEvaluationHelper.readSubmissionJournal().entries));
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].status, 'submitted_unverified');
+    assert.equal((await run(page, { n: 1 })).code, 'UNRESOLVED_HISTORY');
+    assert.equal((await state(page)).submissions.length, 1);
+  });
   test('批次执行锁阻止独立筛选并发', 'normal', async page => {
     const result = await page.evaluate(async () => {
       const pending = window.PDDEvaluationHelper.startBatch({ n: 1 });
@@ -379,7 +453,7 @@ async function main() {
   test('一键运行先刷新到指定地址，再筛选查询回复；保留检查状态', 'normal', async page => {
     await enableNavigationInjection(page);
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('button').count(), 3);
+    assert.equal(await panel.locator('button').count(), 4);
     await panel.locator('#batch-n').fill('2');
     await page.evaluate(() => { window.beforeReloadMarker = true; });
     await clickRunAndWait(page);
@@ -389,7 +463,7 @@ async function main() {
     assert.equal(s.submissions.length, 1);
     assert.deepEqual(await page.evaluate(() => window.sim.filterClicks), ['4星', '5星', '未回复']);
     assert.equal(await panel.locator('#batch-n').inputValue(), '2');
-    assert.equal(await panel.locator('button').count(), 3);
+    assert.equal(await panel.locator('button').count(), 4);
     assert.equal(await panel.locator('#run-once').isDisabled(), false);
     await panel.locator('#refresh').click();
     assert.match(await panel.locator('#inspection').innerText(), /已检查2\/2条；确认回复1条；跳过1条/);
@@ -560,6 +634,76 @@ async function main() {
     assert.equal(page.url(), before);
     assert.equal((await state(page)).queries, 0);
     assert.equal(await panel.locator('#run-once').isDisabled(), false);
+  });
+  test('急停清除跳转期间的任务，目标页加载后不自动执行', 'normal', async page => {
+    await enableNavigationInjection(page);
+    await page.evaluate(() => {
+      const panel = document.getElementById('pdd-evaluation-helper-panel').shadowRoot;
+      panel.getElementById('batch-n').value = '1';
+      // 在跳转请求已发出、源页面离开前，调用真实急停按钮的处理器。
+      panel.getElementById('run-once').addEventListener('click', () => {
+        const panel = document.getElementById('pdd-evaluation-helper-panel').shadowRoot;
+        panel.getElementById('stop').click();
+        sessionStorage.setItem('test:stop-navigation', JSON.stringify({
+          pending: sessionStorage.getItem('pdd-evaluation-helper:pending:v1'),
+          message: panel.getElementById('status').textContent,
+          runDisabled: panel.getElementById('run-once').disabled,
+          stopDisabled: panel.getElementById('stop').disabled,
+        }));
+      });
+    });
+    await page.locator('#pdd-evaluation-helper-panel').locator('#run-once').click();
+    await page.waitForFunction(() => Boolean(window.PDDEvaluationHelper));
+    assert.equal(page.url(), evaluationUrl);
+    const stopped = await page.evaluate(() => JSON.parse(sessionStorage.getItem('test:stop-navigation')));
+    assert.equal(stopped.pending, null);
+    assert.match(stopped.message, /已急停/);
+    assert.equal(stopped.runDisabled, true, '已发出的浏览器导航完成前仍禁止重启');
+    assert.equal(stopped.stopDisabled, false);
+    const s = await state(page);
+    assert.equal(s.queries, 0);
+    assert.equal(s.submissions.length, 0);
+    assert.equal(s.batch, null);
+    assert.equal(await page.locator('#pdd-evaluation-helper-panel').locator('#run-once').isDisabled(), false);
+  });
+  test('急停API清除未消费任务，存储清除失败明确报错', 'normal', async page => {
+    const result = await page.evaluate(() => {
+      const key = 'pdd-evaluation-helper:pending:v1';
+      sessionStorage.setItem(key, '{"action":"start-batch"}');
+      const original = Storage.prototype.removeItem;
+      Storage.prototype.removeItem = function(candidate) {
+        if (candidate !== key) return original.call(this, candidate);
+      };
+      let error;
+      try { window.PDDEvaluationHelper.cancel(); } catch (caught) { error = caught.code; }
+      const preserved = sessionStorage.getItem(key);
+      Storage.prototype.removeItem = original;
+      const cancelled = window.PDDEvaluationHelper.cancel();
+      return { error, preserved, cancelled, pending: sessionStorage.getItem(key) };
+    });
+    assert.equal(result.error, 'STORAGE_UNAVAILABLE');
+    assert.equal(result.preserved, '{"action":"start-batch"}');
+    assert.equal(result.cancelled, true);
+    assert.equal(result.pending, null);
+    assert.equal((await state(page)).queries, 0);
+    assert.equal((await state(page)).submissions.length, 0);
+  });
+  test('跳转任务未能真正消费时零查询，避免刷新自动重跑', 'normal', async page => {
+    await page.addInitScript(() => {
+      const original = Storage.prototype.removeItem;
+      Storage.prototype.removeItem = function(key) {
+        if (key !== 'pdd-evaluation-helper:pending:v1') return original.call(this, key);
+      };
+    });
+    await page.evaluate(() => sessionStorage.setItem('pdd-evaluation-helper:pending:v1', JSON.stringify({
+      schema: 3, action: 'start-batch', sourceUrl: location.href, at: Date.now(), params: { n: 1, goodsId: '' },
+    })));
+    await page.reload();
+    await page.addScriptTag({ content: source });
+    assert.equal((await state(page)).queries, 0);
+    assert.equal((await state(page)).submissions.length, 0);
+    assert.match(await page.locator('#pdd-evaluation-helper-panel').locator('#status').innerText(), /无法清除/);
+    assert.notEqual(await page.evaluate(() => sessionStorage.getItem('pdd-evaluation-helper:pending:v1')), null);
   });
   test('运行期间检查状态可用且不新增查询或提交，不覆盖当前进度', 'query-noop', async page => {
     await page.evaluate(() => {

@@ -131,14 +131,18 @@ async function main() {
     assert.equal((await selectAll(page)).ok, true);
     assert.deepEqual(await counts(page), expectedCounts(1, 1, 1));
   });
-  test('面板保留一键运行、检查状态、导出台账和文案入口，无星级徽标或独立按钮', 'normal', async page => {
+  test('面板保留一键运行、下方急停、检查状态、导出台账和文案入口', 'normal', async page => {
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('button').count(), 3);
+    assert.equal(await panel.locator('button').count(), 4);
     assert.equal(await panel.locator('#run-once').innerText(), '一键运行');
+    assert.equal(await panel.locator('#stop').innerText(), '急停');
+    assert.equal(await panel.locator('#stop').isDisabled(), false);
+    assert.equal(await page.evaluate(() => document.getElementById('pdd-evaluation-helper-panel')
+      .shadowRoot.getElementById('run-once').nextElementSibling.id), 'stop');
     assert.equal(await panel.locator('#refresh').innerText(), '检查状态');
     assert.equal(await panel.locator('#export-batch').innerText(), '导出本机台账');
     assert.equal(await panel.locator('summary').innerText(), '查看统一回复文案');
-    assert.equal(await panel.locator('.badge, [data-select], #all, #stop, #collapse').count(), 0);
+    assert.equal(await panel.locator('.badge, [data-select], #all, #collapse').count(), 0);
     const before = await panel.locator('#status').innerText();
     await panel.locator('#refresh').click();
     assert.match(await panel.locator('#inspection').innerText(), /找到3\/3项，已选0\/3项/);
@@ -151,6 +155,26 @@ async function main() {
     if (process.env.PDD_TEST_SCREENSHOT) {
       await page.screenshot({ path: process.env.PDD_TEST_SCREENSHOT, fullPage: true });
     }
+  });
+  test('急停按钮中断筛选等待，运行期间始终可点击', 'noop', async page => {
+    await page.evaluate(() => {
+      window.pendingResult = window.PDDEvaluationHelper.selectAll().catch(error => ({ code: error.code }));
+    });
+    await page.waitForFunction(() => window.simulation.clicks['4星'] === 1);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    assert.equal(await panel.locator('#run-once').isDisabled(), true);
+    assert.equal(await panel.locator('#stop').isDisabled(), false);
+    await panel.locator('#stop').click();
+    assert.equal((await page.evaluate(() => window.pendingResult)).code, 'CANCELLED');
+    assert.equal(await panel.locator('#run-once').isDisabled(), false);
+    assert.deepEqual(await counts(page), expectedCounts(1, 0, 0));
+  });
+  test('空闲时急停不产生查询或筛选动作', 'normal', async page => {
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#stop').click();
+    assert.match(await panel.locator('#status').innerText(), /没有正在执行的任务/);
+    assert.equal(await page.evaluate(() => window.PDDEvaluationHelper.cancel()), false);
+    assert.deepEqual(await counts(page), expectedCounts(0, 0, 0));
   });
   test('后台其他路径和SPA切换后面板仍可打开，缺少评价区域不是错误', 'normal', async page => {
     await page.evaluate(() => {

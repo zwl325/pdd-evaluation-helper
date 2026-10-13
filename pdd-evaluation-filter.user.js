@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDD评价筛选助手（4星、5星、未回复）
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-13.1
+// @version      2026-10-13.2
 // @description  PDD评价筛选、查询、锁定前N条或全部结果，仅对完全匹配的4/5星模板评价提交统一回复。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：Tampermonkey-点击动作DOM定位清单.md（2026-10-12，非实时DOM）。
   const Config = Object.freeze({
-    version: '2026-10-13.1',
+    version: '2026-10-13.2',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -185,7 +185,7 @@
         }
 
         function onAbort() {
-          finish(new HelperError('CANCELLED', '操作已停止；已经选中的条件保留。'));
+          finish(new HelperError('CANCELLED', '操作已停止；已提交的回复无法撤销，已经选中的条件保留。'));
         }
 
         function check() {
@@ -342,7 +342,7 @@
       try {
         return await execute(job);
       } catch (error) {
-        notify({ tone: 'error', message: error.message });
+        notify({ tone: error.code === 'CANCELLED' ? 'info' : 'error', message: error.message });
         throw error;
       } finally {
         active = null;
@@ -522,6 +522,17 @@
         throw new HelperError('STORAGE_UNAVAILABLE', '本机台账无法保存；回复操作停止。');
       }
     }
+    function remove(store, key) {
+      try {
+        const existed = store.getItem(key) !== null;
+        if (!existed) return false;
+        store.removeItem(key);
+        if (store.getItem(key) !== null) throw new Error('Removal mismatch');
+        return existed;
+      } catch {
+        throw new HelperError('STORAGE_UNAVAILABLE', '待执行任务无法清除；请关闭当前标签页并检查浏览器存储，再重新启动。');
+      }
+    }
     function journal() {
       const data = read(localStorage, Config.journalKey, { schema: 1, entries: {} });
       if (data.schema !== 1 || !data.entries || typeof data.entries !== 'object' || Array.isArray(data.entries)) {
@@ -590,7 +601,7 @@
       anchor.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
-    return Object.freeze({ read, write, journal, unresolved, previous, submission, saveBatch, lastBatch, resolve, exportData });
+    return Object.freeze({ read, write, remove, journal, unresolved, previous, submission, saveBatch, lastBatch, resolve, exportData });
   })();
 
   const Results = (() => {
@@ -913,7 +924,7 @@
         if (location.href === Config.evaluationUrl) location.reload();
         else location.assign(Config.evaluationUrl);
       } catch (error) {
-        sessionStorage.removeItem(Config.pendingKey);
+        Ledger.remove(sessionStorage, Config.pendingKey);
         navigating = false;
         Actions.update({ busy: false, tone: 'error', message: '评价页跳转失败，请重新执行。' });
         throw error;
@@ -922,6 +933,21 @@
     }
     async function oneClickRun(value) {
       return navigate(params(value));
+    }
+    function cancel() {
+      // 先同步中断本页等待，再清除跳转交接；即使存储失败也不继续当前批次。
+      const stopped = Actions.cancel();
+      const hadPending = Ledger.remove(sessionStorage, Config.pendingKey);
+      if (navigating || hadPending) {
+        // 浏览器导航可能已经发出；保留导航锁直到离开/返回，防止再次启动。
+        Actions.update({ tone: 'info',
+          message: '已急停：待执行任务已清除，评价页加载后不会继续。已提交的回复无法撤销。' });
+      } else if (stopped) {
+        Actions.update({ tone: 'info', message: '已请求急停，正在结束当前操作；已提交的回复无法撤销。' });
+      } else {
+        Actions.update({ tone: 'info', message: '当前没有正在执行的任务。' });
+      }
+      return stopped || navigating || hadPending;
     }
     // 本页编排兼容接口；由消费后的导航任务调用，避免再次刷新形成循环。
     async function start(value) {
@@ -954,7 +980,7 @@
       try {
         const pending = Ledger.read(sessionStorage, Config.pendingKey, null);
         if (!pending) return;
-        sessionStorage.removeItem(Config.pendingKey); // 消费一次，刷新不会重新自动提交。
+        Ledger.remove(sessionStorage, Config.pendingKey); // 验证消费成功，刷新不会重新自动提交。
         if (!validPending(pending) || pending.action !== 'start-batch' || !Number.isFinite(pending.at) ||
             Date.now() - pending.at < 0 || Date.now() - pending.at > 120000 ||
             !/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) {
@@ -971,7 +997,7 @@
       navigating = false;
       Actions.update({ busy: false, tone: 'info', message: '已返回页面，点击“一键运行”可重新启动。' });
     }
-    return Object.freeze({ start, oneClickRun, continueNavigation, restoreNavigation });
+    return Object.freeze({ start, oneClickRun, cancel, continueNavigation, restoreNavigation });
   })();
 
   const Panel = (() => {
@@ -1052,6 +1078,8 @@
           input { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid #dce0e7; border-radius: 6px; }
           #run-once { width: 100%; margin-top: 12px; background: #e02e24; color: white; border-color: #e02e24; }
           #run-once:hover:enabled { background: #c8241b; }
+          #stop { width: 100%; margin-top: 6px; color: #b32c22; border-color: #c43a30; background: #fff5f4; }
+          #stop:hover:enabled { color: #fff; background: #b32c22; }
           details { margin-top: 9px; font-size: 12px; color: #626b7a; }
           summary { cursor: pointer; }
           #reply-copy { margin: 6px 0 0; overflow-wrap: anywhere; }
@@ -1064,6 +1092,8 @@
             <label for="batch-goods">商品 ID（可选）</label>
             <input id="batch-goods" type="text" inputmode="numeric" placeholder="留空查询全部商品">
             <button id="run-once" type="button">一键运行</button>
+            <button id="stop" type="button" aria-describedby="stop-help">急停</button>
+            <p id="stop-help" class="hint">停止后续操作；已提交的回复无法撤销。</p>
             <p id="status" role="status" aria-live="polite"></p>
             <div class="tools">
               <button id="refresh" type="button">检查状态</button>
@@ -1078,6 +1108,9 @@
         void Workflow.oneClickRun({ n: shadow.querySelector('#batch-n').value,
           goodsId: shadow.querySelector('#batch-goods').value })
           .catch(error => Actions.update({ tone: 'error', message: error.message }));
+      });
+      shadow.querySelector('#stop').addEventListener('click', () => {
+        try { Workflow.cancel(); } catch (error) { Actions.update({ tone: 'error', message: error.message }); }
       });
       shadow.querySelector('#refresh').addEventListener('click', () => {
         checkedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -1177,6 +1210,7 @@
     function stop() {
       if (!started) return;
       started = false;
+      // 页面离开只中断当前执行；正常一键跳转必须保留待执行任务供目标页消费。
       Actions.cancel();
       observer.disconnect();
       clearInterval(intervalId);
@@ -1212,7 +1246,7 @@
       resolveSubmission: Ledger.resolve,
       select: Actions.select,
       selectAll: Actions.selectAll,
-      cancel: Actions.cancel,
+      cancel: Workflow.cancel,
     }),
   });
 
