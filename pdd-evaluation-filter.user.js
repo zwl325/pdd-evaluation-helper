@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDD评价筛选助手（4星、5星、未回复）
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-12.4
+// @version      2026-10-13.1
 // @description  PDD评价筛选、查询、锁定前N条或全部结果，仅对完全匹配的4/5星模板评价提交统一回复。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：Tampermonkey-点击动作DOM定位清单.md（2026-10-12，非实时DOM）。
   const Config = Object.freeze({
-    version: '2026-10-12.4',
+    version: '2026-10-13.1',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -380,21 +380,14 @@
       if (found.length !== 1) throw new HelperError('DOM_NOT_UNIQUE', `${label}：找到${found.length}个可见目标。`);
       return found[0];
     }
-    function shop(optional = false) {
-      // 沿用交接文件的页头身份结构；自动推断，不硬编码历史店铺。
+    function shopLabel() {
+      // 仅作台账备注；读不到、重名或页头结构变化都不限制运行。
       const body = document.body.innerText;
       const end = body.indexOf('后台首页');
       const lines = (end >= 0 ? body.slice(0, end) : '').split('\n').map(line => line.trim()).filter(Boolean);
       const names = [...new Set(lines.filter(line =>
         !/[：:]/.test(line) && lines.some(other => other.startsWith(`${line}：`) || other.startsWith(`${line}:`))))];
-      if (!lines.includes('退出当前账号') || names.length !== 1) {
-        if (optional) return null;
-        throw new HelperError('SHOP_UNVERIFIED', '无法唯一识别当前店铺。需核查页头店铺行、子账号行及登录状态后调整定位。');
-      }
-      return names[0];
-    }
-    function assertShop(expected) {
-      if (shop() !== expected) throw new HelperError('SHOP_CHANGED', '当前店铺已变化，批次停止。');
+      return names.length === 1 ? names[0] : '';
     }
     const form = (optional = false) => one(Config.selectors.form, '评价查询表单', DOM.root() || document, optional);
     const goods = () => one(Config.selectors.goods, '商品ID输入框', form());
@@ -421,7 +414,8 @@
         selected: all(Config.filterSelector, DOM.root()).filter(DOM.selected).map(text).sort(),
       });
     }
-    function identity(group, shopName) {
+    const recordKey = ({ order, goodsId, time }) => JSON.stringify([order, goodsId, time]);
+    function identity(group, shopName = '') {
       const row = one(Config.selectors.row, '评价正文行', group);
       const wrapper = one(Config.selectors.content, '评价正文容器', row);
       const orderValues = [...new Set([...group.innerText.matchAll(/订单编号[：:]\s*([\d-]+)/g)].map(match => match[1]))];
@@ -432,7 +426,7 @@
         throw new HelperError('INCOMPLETE_RECORD', '评价身份或全文不可读取，锁定/回复停止。');
       }
       return { shop: shopName, order: orderValues[0], goodsId, time,
-        key: JSON.stringify([shopName, orderValues[0], goodsId, time]) };
+        key: recordKey({ order: orderValues[0], goodsId, time }) };
     }
     function record(group, shopName) {
       const value = identity(group, shopName);
@@ -448,7 +442,6 @@
     const table = (optional = false) => one(Config.selectors.table, '评价结果表', DOM.root() || document, optional);
     const groups = () => all(Config.selectors.group, table()).filter(DOM.visible);
     function find(recordValue) {
-      assertShop(recordValue.shop);
       const matches = groups().filter(group => identity(group, recordValue.shop).key === recordValue.key);
       if (matches.length > 1) throw new HelperError('DUPLICATE_RECORD', '当前页评价身份重复，已停止。');
       return matches[0] || null;
@@ -506,8 +499,8 @@
       return group && all('*', group).some(element => DOM.visible(element) &&
         element.innerText === Config.replyText && !element.closest(Config.selectors.content));
     }
-    return Object.freeze({ all, text, one, shop, assertShop, form, goods, queryButton, setValue,
-      filterSignature, record, eligible, table, groups, find, page, canTurn, busy, fingerprint, empty,
+    return Object.freeze({ all, text, one, shopLabel, form, goods, queryButton, setValue,
+      filterSignature, recordKey, record, eligible, table, groups, find, page, canTurn, busy, fingerprint, empty,
       replyLink, modals, modal, successMessages, replyEcho });
   })();
 
@@ -535,22 +528,32 @@
         throw new HelperError('INVALID_JOURNAL', '回复台账格式异常，需人工核查。');
       }
       if (Object.entries(data.entries).some(([key, entry]) => !entry || entry.key !== key ||
-          typeof entry.shop !== 'string' || !['submitting', 'submitted_unverified', 'confirmed',
+          (entry.shop !== undefined && typeof entry.shop !== 'string') ||
+          ![entry.order, entry.goodsId, entry.time].every(value => typeof value === 'string' && value.length) ||
+          !['submitting', 'submitted_unverified', 'confirmed',
             'not_replied_user_verified'].includes(entry.status))) {
         throw new HelperError('INVALID_JOURNAL', '回复台账含未知状态或不完整身份，需人工核查。');
       }
       return data;
     }
-    function unresolved(shop) {
-      return Object.values(journal().entries).filter(entry => entry.shop === shop &&
+    function unresolved(records) {
+      const keys = new Set(records.map(rec => rec.key));
+      return Object.values(journal().entries).filter(entry => keys.has(ReviewDOM.recordKey(entry)) &&
         ['submitting', 'submitted_unverified'].includes(entry.status));
+    }
+    function previous(rec, data = journal()) {
+      // 旧版key含店铺名；用原记录字段兼容读取，不删除旧条目或核验依据。
+      const entries = Object.values(data.entries).filter(entry => ReviewDOM.recordKey(entry) === rec.key);
+      return entries.find(entry => ['submitting', 'submitted_unverified'].includes(entry.status)) ||
+        entries.find(entry => entry.status === 'confirmed') ||
+        entries.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))[0];
     }
     function submission(rec, status, evidence = '') {
       const data = journal();
-      const previous = data.entries[rec.key];
-      const history = previous ? [...(previous.history || []),
-        { status: previous.status, at: previous.at, evidence: previous.evidence,
-          manualVerification: previous.manualVerification }] : [];
+      const prior = previous(rec, data);
+      const history = prior ? [...(prior.history || []),
+        { status: prior.status, at: prior.at, evidence: prior.evidence,
+          manualVerification: prior.manualVerification, key: prior.key }] : [];
       data.entries[rec.key] = { key: rec.key, shop: rec.shop, order: rec.order, goodsId: rec.goodsId,
         time: rec.time, status, replyText: Config.replyText, at: new Date().toISOString(), evidence, history };
       write(localStorage, Config.journalKey, data);
@@ -569,7 +572,6 @@
       if (!entry || !['submitting', 'submitted_unverified'].includes(entry.status)) {
         throw new HelperError('NO_UNCERTAIN_ENTRY', '没有该身份对应的未知提交。');
       }
-      ReviewDOM.assertShop(entry.shop);
       entry.history = [...(entry.history || []),
         { status: entry.status, at: entry.at, evidence: entry.evidence }];
       entry.status = verdict;
@@ -588,7 +590,7 @@
       anchor.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
-    return Object.freeze({ read, write, journal, unresolved, submission, saveBatch, lastBatch, resolve, exportData });
+    return Object.freeze({ read, write, journal, unresolved, previous, submission, saveBatch, lastBatch, resolve, exportData });
   })();
 
   const Results = (() => {
@@ -816,21 +818,17 @@
       }
       const goodsId = value.goodsId === undefined || value.goodsId === null ? '' : String(value.goodsId).trim();
       if (goodsId && !/^\d+$/.test(goodsId)) throw new HelperError('INVALID_GOODS_ID', '商品ID必须是完整数字，或留空。');
-      return { n, goodsId, expectedShop: String(value.expectedShop || '').trim() };
+      return { n, goodsId };
     }
     async function execute(p, job) {
       const options = job.options;
       await Wait.until(() => Boolean(DOM.root() && DOM.snapshot().ready && ReviewDOM.form(true) && ReviewDOM.table(true)),
         { ...options, timeoutMs: Config.resultTimeoutMs, description: '等待评价页加载' });
-      const shop = ReviewDOM.shop();
-      if (p.expectedShop && shop !== p.expectedShop) throw new HelperError('SHOP_CHANGED', '当前店铺与启动时指定的店铺不同。');
-      const unresolved = Ledger.unresolved(shop);
-      if (unresolved.length) throw new HelperError('UNRESOLVED_HISTORY', '该店铺存在未知提交，需先人工核验历史记录，不能启动新批次。');
+      const shop = ReviewDOM.shopLabel();
       const initialGuard = options.guard;
       let filterSignature;
       options.guard = () => {
         initialGuard();
-        ReviewDOM.assertShop(shop);
         if (filterSignature && ReviewDOM.filterSignature() !== filterSignature) {
           throw new HelperError('FILTER_CHANGED', '批次期间查询条件改变，已停止。');
         }
@@ -852,7 +850,7 @@
         if (ReviewDOM.modals().length) throw new HelperError('EXISTING_MODAL', '页面已有弹框，查询前停止。');
         filterSignature = ReviewDOM.filterSignature();
         batch.filters = JSON.parse(filterSignature);
-        Actions.update({ message: `店铺：${shop}。查询商品${p.goodsId || '全部'}；检查${p.n ?? '全部'}条。` });
+        Actions.update({ message: `查询商品${p.goodsId || '全部'}；检查${p.n ?? '全部'}条。` });
         await Results.transition(() => {
           const button = ReviewDOM.queryButton();
           if (!DOM.enabled(button)) throw new HelperError('QUERY_DISABLED', '查询按钮不可点击。');
@@ -860,12 +858,19 @@
         }, options, 1);
         batch.phase = 'freezing';
         await Results.freeze(batch, options);
+        // 未知提交只阻止包含原身份的锁定范围，不以店铺名封锁其他店铺/订单。
+        if (Ledger.unresolved(batch.records).length) {
+          throw new HelperError('UNRESOLVED_HISTORY', '锁定范围包含未知提交记录，需先人工核验对应台账，未开始本批回复。');
+        }
         batch.phase = 'replying';
         Ledger.saveBatch(batch);
         for (const rec of batch.records) {
           options.guard();
           Actions.update({ message: `锁定${batch.records.length}条；正在检查第${rec.rank}条，订单${rec.order}。` });
-          const prior = Ledger.journal().entries[rec.key];
+          const prior = Ledger.previous(rec);
+          if (prior && ['submitting', 'submitted_unverified'].includes(prior.status)) {
+            throw new HelperError('UNRESOLVED_HISTORY', '当前记录存在未知提交，需先人工核验，未重复发送。');
+          }
           if (prior?.status === 'confirmed') {
             rec.status = 'skipped_previously_confirmed';
           } else {
@@ -899,11 +904,8 @@
     }
     function navigate(p) {
       if (navigating || Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
-      // 其他后台页可能没有评价页的店铺结构；先导航，目标页仍严格识别店铺。
-      const shop = ReviewDOM.shop(true);
-      if (shop && p.expectedShop && p.expectedShop !== shop) throw new HelperError('SHOP_CHANGED', '启动店铺不符。');
-      Ledger.write(sessionStorage, Config.pendingKey, { schema: 2, action: 'start-batch',
-        sourceUrl: location.href, params: { ...p, expectedShop: shop || p.expectedShop }, at: Date.now() });
+      Ledger.write(sessionStorage, Config.pendingKey, { schema: 3, action: 'start-batch',
+        sourceUrl: location.href, params: p, at: Date.now() });
       navigating = true;
       Actions.update({ busy: true, tone: 'info', message: '正在重新加载评价页，随后自动执行…' });
       try {
@@ -935,13 +937,13 @@
       });
     }
     function validPending(pending) {
-      if (pending.schema === 1) return typeof pending.params?.expectedShop === 'string' &&
-        Boolean(pending.params.expectedShop.trim());
-      if (pending.schema !== 2 || !pending.params || Array.isArray(pending.params)) return false;
+      // 接受前两版完整导航参数；旧店铺约束不再参与执行。
+      if (![1, 2, 3].includes(pending.schema) || !pending.params || Array.isArray(pending.params)) return false;
       const p = pending.params;
       if (!(p.n === null || Number.isSafeInteger(p.n) && p.n > 0) ||
-          typeof p.goodsId !== 'string' || !/^\d*$/.test(p.goodsId) ||
-          typeof p.expectedShop !== 'string' || typeof pending.sourceUrl !== 'string') return false;
+          typeof p.goodsId !== 'string' || !/^\d*$/.test(p.goodsId)) return false;
+      if (pending.schema === 1) return true;
+      if (typeof pending.sourceUrl !== 'string') return false;
       try {
         return new URL(pending.sourceUrl).origin === location.origin;
       } catch {

@@ -143,17 +143,45 @@ async function main() {
     assert.equal((await run(page, { n: 1 })).code, 'INCOMPLETE_RECORD');
     assert.equal((await state(page)).submissions.length, 0);
   });
-  test('店铺身份不可识别，零查询零提交', 'bad-shop', async page => {
-    assert.equal((await run(page)).code, 'SHOP_UNVERIFIED');
-    assert.equal((await state(page)).queries, 0);
+  test('店铺页头无法识别也正常查询和回复，店铺只作可选备注', 'bad-shop', async page => {
+    const result = await run(page, { n: 1 });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.replied, 1);
+    assert.equal(result.batch.shop, '');
+    assert.equal(result.batch.records[0].shop, '');
+    assert.equal(result.batch.records[0].key,
+      JSON.stringify(['990000-000000001', '9001', '2026-10-12 10:00:00']));
   });
-  test('显式店铺不匹配时停止', 'normal', async page => {
-    assert.equal((await run(page, { expectedShop: '另一个店铺' })).code, 'SHOP_CHANGED');
-    assert.equal((await state(page)).submissions.length, 0);
+  test('旧版指定店铺参数被忽略，不限制其他店铺运行', 'normal', async page => {
+    const result = await run(page, { n: 1, expectedShop: '另一个店铺' });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.replied, 1);
+    assert.deepEqual(result.batch.params, { n: 1, goodsId: '' });
   });
-  test('提交前店铺切换，零提交', 'shop-change', async page => {
-    assert.equal((await run(page, { n: 1 })).code, 'SHOP_CHANGED');
-    assert.equal((await state(page)).submissions.length, 0);
+  test('页头店铺文案改变不停止，继续核对原评价身份和正文', 'shop-change', async page => {
+    const result = await run(page, { n: 1 });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.replied, 1);
+    assert.equal((await state(page)).submissions.length, 1);
+  });
+  test('任意店铺名称及重复页头结构均可运行，不依赖固定名称', 'normal', async page => {
+    const names = ['甲号测试铺', '乙号：测试铺', ''];
+    for (let i = 0; i < names.length; i++) {
+      if (i) {
+        await page.reload();
+        await page.addScriptTag({ content: source });
+      }
+      await page.evaluate(({ name, index }) => {
+        const header = document.getElementById('shop-header');
+        if (name) header.textContent = `${name}\n${name}：子账号\n退出当前账号`;
+        else header.innerHTML = '甲铺<br>甲铺：子账号<br>乙铺<br>乙铺：子账号';
+        window.sim.records[0].order = `991000-00000000${index}`;
+      }, { name: names[i], index: i });
+      const result = await run(page, { n: 1 });
+      assert.equal(result.ok, true, result.message);
+      assert.equal(result.replied, 1);
+      assert.equal(result.batch.records[0].order, `991000-00000000${i}`);
+    }
   });
   test('未指定的残留订单条件阻止查询', 'residual', async page => {
     assert.equal((await run(page)).code, 'RESIDUAL_FILTER');
@@ -192,7 +220,7 @@ async function main() {
     assert.equal((await run(page, { n: 1 })).code, 'UNRESOLVED_HISTORY');
     s = await state(page);
     assert.equal(s.submissions.length, 1);
-    assert.equal(s.queries, 1);
+    assert.equal(s.queries, 2, '先查询并锁定，再按记录身份核验未知历史');
   });
   test('旧成功提示不能确认本次未验证提交', 'stale-toast', async page => {
     assert.equal((await run(page, { n: 1 })).code, 'SUBMITTED_UNVERIFIED');
@@ -208,6 +236,7 @@ async function main() {
   });
   test('人工明确核验后解除阻塞并保留历史证据', 'unknown', async page => {
     assert.equal((await run(page, { n: 1 })).code, 'SUBMITTED_UNVERIFIED');
+    await page.evaluate(() => document.getElementById('shop-header').remove());
     const entry = await page.evaluate(() => {
       const journal = window.PDDEvaluationHelper.readSubmissionJournal();
       const key = Object.keys(journal.entries)[0];
@@ -224,6 +253,7 @@ async function main() {
     assert.equal((await run(page, { n: 1 })).replied, 1);
     await page.evaluate(() => {
       window.sim.records[0].replied = false;
+      document.getElementById('shop-header').innerHTML = '店铺页头结构已改变';
       document.getElementById('query').click();
     });
     await page.waitForFunction(() => !document.querySelector('[aria-busy="true"]'));
@@ -231,6 +261,75 @@ async function main() {
     assert.equal(second.replied, 0);
     assert.equal(second.batch.records[0].status, 'skipped_previously_confirmed');
     assert.equal((await state(page)).submissions.length, 1);
+  });
+  test('旧版含店铺名的已确认台账继续去重，缺少页头也不会重发', 'normal', async page => {
+    const oldKey = await page.evaluate(() => {
+      const rec = window.sim.records[0];
+      const key = JSON.stringify(['旧测试店铺', rec.order, rec.goodsId, rec.time]);
+      localStorage.setItem('pdd-evaluation-helper:submissions:v1', JSON.stringify({ schema: 1,
+        entries: { [key]: { key, shop: '旧测试店铺', order: rec.order, goodsId: rec.goodsId,
+          time: rec.time, status: 'confirmed', at: '2026-10-12T01:00:00Z', evidence: 'legacy_success' } } }));
+      document.getElementById('shop-header').remove();
+      return key;
+    });
+    const result = await run(page, { n: 1 });
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual([result.checked, result.replied, result.skipped], [1, 0, 1]);
+    assert.equal(result.batch.records[0].status, 'skipped_previously_confirmed');
+    assert.equal((await state(page)).submissions.length, 0);
+    assert.equal(await page.evaluate(key =>
+      window.PDDEvaluationHelper.readSubmissionJournal().entries[key].evidence, oldKey), 'legacy_success');
+  });
+  test('旧版未知台账命中锁定记录时，开始回复前停止，不重发也不先回复其他条', 'normal', async page => {
+    await page.evaluate(() => {
+      const rec = window.sim.records[2];
+      const key = JSON.stringify(['旧测试店铺', rec.order, rec.goodsId, rec.time]);
+      localStorage.setItem('pdd-evaluation-helper:submissions:v1', JSON.stringify({ schema: 1,
+        entries: { [key]: { key, shop: '旧测试店铺', order: rec.order, goodsId: rec.goodsId,
+          time: rec.time, status: 'submitted_unverified' } } }));
+      document.getElementById('shop-header').remove();
+    });
+    assert.equal((await run(page, { n: 3 })).code, 'UNRESOLVED_HISTORY');
+    const s = await state(page);
+    assert.equal(s.queries, 1);
+    assert.equal(s.batch.records.length, 3);
+    assert.equal(s.opens.length, 0);
+    assert.equal(s.submissions.length, 0);
+  });
+  test('其他店铺或其他订单的未知历史不阻止当前锁定范围', 'normal', async page => {
+    await page.evaluate(() => {
+      const rec = { shop: '另一个测试店铺', order: '992000-000000001', goodsId: '9999',
+        time: '2026-10-01 10:00:00', status: 'submitted_unverified' };
+      const key = JSON.stringify([rec.shop, rec.order, rec.goodsId, rec.time]);
+      localStorage.setItem('pdd-evaluation-helper:submissions:v1', JSON.stringify({ schema: 1,
+        entries: { [key]: { ...rec, key } } }));
+      document.getElementById('shop-header').remove();
+    });
+    const result = await run(page, { n: 1 });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.replied, 1);
+    const entries = await page.evaluate(() => Object.values(window.PDDEvaluationHelper.readSubmissionJournal().entries));
+    assert.equal(entries.filter(entry => entry.status === 'submitted_unverified').length, 1);
+    assert.equal(entries.filter(entry => entry.status === 'confirmed').length, 1);
+  });
+  test('旧台账核验为未回复后可重新发送，保留旧条目和人工核验历史', 'normal', async page => {
+    const oldKey = await page.evaluate(() => {
+      const rec = window.sim.records[0];
+      const key = JSON.stringify(['旧测试店铺', rec.order, rec.goodsId, rec.time]);
+      localStorage.setItem('pdd-evaluation-helper:submissions:v1', JSON.stringify({ schema: 1,
+        entries: { [key]: { key, shop: '旧测试店铺', order: rec.order, goodsId: rec.goodsId,
+          time: rec.time, status: 'submitted_unverified', history: [] } } }));
+      document.getElementById('shop-header').remove();
+      window.PDDEvaluationHelper.resolveSubmission(key, 'not_replied_user_verified', '离线核验：确实未回复');
+      return key;
+    });
+    const result = await run(page, { n: 1 });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.replied, 1);
+    const entries = await page.evaluate(() => window.PDDEvaluationHelper.readSubmissionJournal().entries);
+    assert.equal(entries[oldKey].status, 'not_replied_user_verified');
+    assert.ok(entries[result.batch.records[0].key].history.some(previous =>
+      previous.status === 'not_replied_user_verified' && previous.manualVerification?.note === '离线核验：确实未回复'));
   });
   test('持久化失败时不发出提交', 'normal', async page => {
     await page.evaluate(() => {
@@ -338,10 +437,10 @@ async function main() {
     assert.equal(context.pages().length, originalTabs);
     assert.deepEqual(s.batch.summary, { checked: 1, replied: 1, skipped: 0 });
     assert.equal(s.batch.params.goodsId, '9001');
-    assert.equal(s.batch.params.expectedShop, '测试店铺');
+    assert.deepEqual(s.batch.params, { n: 1, goodsId: '9001' });
     assert.deepEqual(await page.evaluate(() => window.sim.filterClicks), ['4星', '5星', '未回复']);
   });
-  test('其他后台页无法读取店铺也能先跳转，在评价页严格识别店铺', 'normal', async (page, context) => {
+  test('其他后台页无法读取店铺也能跳转执行，评价页名称仅作台账备注', 'normal', async (page, context) => {
     const sourceUrl = 'https://mms.pinduoduo.com/goods/manage';
     await context.route(sourceUrl, route => route.fulfill({ status: 200,
       contentType: 'text/html; charset=utf-8', body: otherPage(null) }));
@@ -357,7 +456,7 @@ async function main() {
     assert.equal(s.queries, 1);
     assert.equal(s.submissions.length, 1);
   });
-  test('其他后台页已识别店铺，跳转后店铺改变时不查询不回复', 'normal', async (page, context) => {
+  test('跳转前后店铺名称不同也正常执行，不绑定启动店铺', 'normal', async (page, context) => {
     const sourceUrl = 'https://mms.pinduoduo.com/orders/list';
     await context.route(sourceUrl, route => route.fulfill({ status: 200,
       contentType: 'text/html; charset=utf-8', body: otherPage('另一测试店铺') }));
@@ -365,17 +464,13 @@ async function main() {
     await page.goto(sourceUrl);
     const panel = page.locator('#pdd-evaluation-helper-panel');
     await panel.locator('#batch-n').fill('1');
-    const navigation = page.waitForEvent('framenavigated', { predicate: frame => frame === page.mainFrame() });
-    await panel.locator('#run-once').click();
-    await navigation;
-    await page.waitForFunction(() => document.getElementById('pdd-evaluation-helper-panel')
-      .shadowRoot.getElementById('status').dataset.tone === 'error');
-    assert.equal(page.url(), evaluationUrl);
-    assert.match(await panel.locator('#status').innerText(), /店铺.*不同/);
-    assert.equal((await state(page)).queries, 0);
-    assert.equal((await state(page)).submissions.length, 0);
+    await clickRunAndWait(page);
+    const s = await state(page);
+    assert.equal(s.batch.shop, '测试店铺');
+    assert.equal(s.queries, 1);
+    assert.equal(s.submissions.length, 1);
   });
-  test('其他后台页启动后目标评价页店铺仍不可识别时不查询不回复', 'normal', async (page, context) => {
+  test('启动页与评价页都没有可读店铺页头时仍正常执行', 'normal', async (page, context) => {
     const sourceUrl = 'https://mms.pinduoduo.com/goods/manage';
     await context.route(sourceUrl, route => route.fulfill({ status: 200,
       contentType: 'text/html; charset=utf-8', body: otherPage(null) }));
@@ -386,15 +481,11 @@ async function main() {
     await page.goto(sourceUrl);
     const panel = page.locator('#pdd-evaluation-helper-panel');
     await panel.locator('#batch-n').fill('1');
-    const navigation = page.waitForEvent('framenavigated', { predicate: frame => frame === page.mainFrame() });
-    await panel.locator('#run-once').click();
-    await navigation;
-    await page.waitForFunction(() => document.getElementById('pdd-evaluation-helper-panel')
-      .shadowRoot.getElementById('status').dataset.tone === 'error');
-    assert.equal(page.url(), evaluationUrl);
-    assert.match(await panel.locator('#status').innerText(), /无法唯一识别当前店铺/);
-    assert.equal((await state(page)).queries, 0);
-    assert.equal((await state(page)).submissions.length, 0);
+    await clickRunAndWait(page);
+    const s = await state(page);
+    assert.equal(s.batch.shop, '');
+    assert.equal(s.queries, 1);
+    assert.equal(s.submissions.length, 1);
   });
   test('已在完全相同的目标地址也刷新，当前标签页只加载一次', 'normal', async (page, context) => {
     await enableNavigationInjection(page);
@@ -491,10 +582,10 @@ async function main() {
     assert.match(await panel.locator('#inspection').innerText(), /停止原因/);
   });
   test('损坏、过期或缺少检查范围的导航标记不启动全部回复', 'normal', async page => {
-    const valid = { schema: 2, action: 'start-batch', sourceUrl: 'https://mms.pinduoduo.com/goods/manage',
-      at: Date.now(), params: { n: 1, goodsId: '', expectedShop: '' } };
+    const valid = { schema: 3, action: 'start-batch', sourceUrl: 'https://mms.pinduoduo.com/goods/manage',
+      at: Date.now(), params: { n: 1, goodsId: '' } };
     for (const pending of [{ params: {} }, { ...valid, params: {} },
-      { ...valid, params: { goodsId: '', expectedShop: '' } },
+      { ...valid, params: { goodsId: '' } },
       { ...valid, sourceUrl: 'https://example.invalid/' }, { ...valid, at: Date.now() - 180000 }]) {
       await page.evaluate(pending => {
         sessionStorage.setItem('pdd-evaluation-helper:pending:v1', JSON.stringify(pending));
@@ -503,6 +594,23 @@ async function main() {
       await page.addScriptTag({ content: source });
       assert.equal((await state(page)).queries, 0);
       assert.equal((await state(page)).submissions.length, 0);
+    }
+  });
+  test('旧版导航参数仍能继续一次，旧店铺限制不再生效', 'normal', async page => {
+    for (const schema of [1, 2]) {
+      await page.evaluate(schema => {
+        sessionStorage.removeItem('pdd-evaluation-helper:last-batch:v1');
+        sessionStorage.setItem('pdd-evaluation-helper:pending:v1', JSON.stringify({ schema,
+          action: 'start-batch', sourceUrl: location.href, at: Date.now(),
+          params: { n: 1, goodsId: '', expectedShop: '旧店铺名称' } }));
+      }, schema);
+      await page.reload();
+      await page.addScriptTag({ content: source });
+      await page.waitForFunction(() => window.PDDEvaluationHelper.readBatch()?.phase === 'completed');
+      const s = await state(page);
+      assert.deepEqual(s.batch.params, { n: 1, goodsId: '' });
+      assert.equal(s.queries, 1);
+      assert.equal(await page.evaluate(() => sessionStorage.getItem('pdd-evaluation-helper:pending:v1')), null);
     }
   });
 
