@@ -1,6 +1,6 @@
 # PDD 评价筛选与模板回复助手
 
-版本：**2026-10-13.2**。保持原脚本的 `@name`、`@namespace` 和安装文件名，已有安装可以原位更新。
+版本：**2026-10-13.3**。脚本名称为 **PDD评价筛选助手 v2026-10-13.3**，不再附带“（4星、5星、未回复）”。名称中的版本随发布同步生成；`@namespace`、安装文件名及更新地址保持固定。
 
 UI/UX 与生命周期管理的后续计划见 [TODO.md](TODO.md)；本次严重 bug 与隐患检查见 [REVIEW-NOTES.md](REVIEW-NOTES.md)，其中两项 P1 风险仍待处理。
 
@@ -175,19 +175,39 @@ window.PDDEvaluationHelper.cancel();          // 与急停按钮相同，同步�
 | `@updateURL` | [pdd-evaluation-filter.meta.js](https://raw.githubusercontent.com/zwl325/pdd-evaluation-helper/main/pdd-evaluation-filter.meta.js) |
 | `@downloadURL` | [pdd-evaluation-filter.user.js](https://raw.githubusercontent.com/zwl325/pdd-evaluation-helper/main/pdd-evaluation-filter.user.js) |
 
-检查周期由Tampermonkey设置决定。旧版2026-10-12尚无更新源，需要通过安装链接更新一次；2026-10-12.1至2026-10-13.1可使用已配置的更新源获取本版。更新脚本后，再刷新已打开的PDD后台页面，页头版本显示`2026-10-13.2`即可确认当前页面已加载本版。
+检查周期由Tampermonkey设置决定。旧版2026-10-12尚无更新源，需要通过安装链接更新一次；2026-10-12.1至2026-10-13.2已配置更新源。已有安装建议在原脚本上执行“检查更新”，再刷新已打开的PDD后台页面，面板版本显示`2026-10-13.3`即可确认当前页面已加载本版。
 
-维护者修改后递增`@version`和`Config.version`，运行：
+本版按需求把版本加入`@name`。若手动打开安装链接后Tampermonkey提示新增另一个脚本，请先停用旧副本，或在原脚本编辑器中替换代码；确保只有一个副本启用，避免两个实例同时运行。仅保持命名空间不作为手动安装一定原位更新的保证。
+
+## 版本管理与发布
+
+使用日期式版本 **`YYYY-MM-DD.N`**：日期取发布当天，同一天从`.1`开始递增；例如本次为`2026-10-13.3`，当天后续发布为`.4`，次日首次发布为`2026-10-14.1`。沿用已有日期式版本序列，避免切换到较小的新版本号影响更新比较。Tampermonkey官方文档说明`@version`用于更新检查，每次更新都应递增，并给出了日期式版本示例。
+
+`@version`是唯一版本来源。不要手动分别维护名称、运行时版本与元数据；执行升版命令后，工具同时生成：
+
+- 主脚本的`@name`：`PDD评价筛选助手 v<版本>`。
+- 主脚本的`@version`和`Config.version`。
+- 用于更新检查的轻量`pdd-evaluation-filter.meta.js`。
+
+例如下次同日发布，运行以下命令；其他日期替换成当次发布版本：
 
 ```text
-node scripts/sync-metadata.cjs
+node scripts/sync-metadata.cjs --version 2026-10-13.4
 node scripts/sync-metadata.cjs --check
+node tests/metadata.spec.cjs
 node --check pdd-evaluation-filter.user.js
+```
+
+升版命令要求版本严格大于当前版本，按数字比较日期与序号（`.10`大于`.9`），拒绝同版重发、降版、非法日期、零序号和前导零。无参数的`node scripts/sync-metadata.cjs`仅按当前`@version`重新同步；`--check`只读，检测不一致时失败，不修改文件。
+
+如果本次还修改DOM、交互或批次流程，另行运行浏览器回归：
+
+```text
 node tests/filter-helper.spec.cjs
 node tests/batch-workflow.spec.cjs
 ```
 
-然后用`git`提交并推送。`sync-metadata.cjs`从主脚本生成轻量`.meta.js`，避免元数据分叉。GitHub Actions检查语法和元数据一致性；浏览器流程测试在本机运行。
+检查通过后更新[CHANGELOG.md](CHANGELOG.md)，使用`git`提交并推送到`main`；以同一提交创建`v<@version>`标签和GitHub Release，附上主脚本与元数据文件及发布说明。已发布标签和版本不覆盖，修正需要新版本。GitHub Actions检查语法、名称/版本/元数据一致性及10项版本工具测试；浏览器流程测试在本机运行。
 
 ## 验证边界
 

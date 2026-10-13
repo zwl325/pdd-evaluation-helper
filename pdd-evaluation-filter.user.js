@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手（4星、5星、未回复）
+// @name         PDD评价筛选助手 v2026-10-13.3
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-13.2
+// @version      2026-10-13.3
 // @description  PDD评价筛选、查询、锁定前N条或全部结果，仅对完全匹配的4/5星模板评价提交统一回复。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：Tampermonkey-点击动作DOM定位清单.md（2026-10-12，非实时DOM）。
   const Config = Object.freeze({
-    version: '2026-10-13.2',
+    version: '2026-10-13.3',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',

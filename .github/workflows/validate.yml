@@ -22,5 +22,8 @@ jobs:
           node --check scripts/sync-metadata.cjs
           node --check tests/filter-helper.spec.cjs
           node --check tests/batch-workflow.spec.cjs
+          node --check tests/metadata.spec.cjs
       - name: Check version and update metadata
         run: node scripts/sync-metadata.cjs --check
+      - name: Verify release version tooling
+        run: node tests/metadata.spec.cjs
