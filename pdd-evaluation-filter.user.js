@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-13.3
+// @name         PDD评价筛选助手 v2026-10-13.4
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-13.3
-// @description  PDD评价筛选、查询、锁定前N条或全部结果，仅对完全匹配的4/5星模板评价提交统一回复。
+// @version      2026-10-13.4
+// @description  PDD评价筛选与逐条即时回复，支持检查计数、可拖拽折叠面板及精确匹配的默认好评正文。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
 // @supportURL   https://github.com/zwl325/pdd-evaluation-helper/issues
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：Tampermonkey-点击动作DOM定位清单.md（2026-10-12，非实时DOM）。
   const Config = Object.freeze({
-    version: '2026-10-13.3',
+    version: '2026-10-13.4',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -43,8 +43,9 @@
     pendingKey: 'pdd-evaluation-helper:pending:v1',
     journalKey: 'pdd-evaluation-helper:submissions:v1',
     batchKey: 'pdd-evaluation-helper:last-batch:v1',
+    panelKey: 'pdd-evaluation-helper:panel:v1',
     lockName: 'pdd-evaluation-helper:batch:v1',
-    replyPattern: /^该用户觉得商品很好，给出了[45]星好评$/,
+    replyPattern: /^该用户觉得商品很好(?:，给出了[45]星好评)?$/,
     replyText: '小店每天最开心的事莫过于看到亲的好评，亲的好评就像是清泉一样滋润我们的心田，小店会更加的珍惜亲的好评，不断的改进自己，完善自己，力求让小店的服务做得更好，店铺做得更大，也是为了让亲能够更好的买到自己的喜欢的宝贝。你的好评就是对我们最大的肯定和鼓励，希望亲再次关顾我们的店铺，检验小店的进步。',
     selectors: Object.freeze({
       form: '#evaluationSearchId form',
@@ -423,7 +424,7 @@
       const goodsId = /^(?:ID|商品ID)\s*[：:]\s*(\d+)$/i.exec(goodsText)?.[1];
       const time = text(one(Config.selectors.time, '评价时间', wrapper));
       if (orderValues.length !== 1 || !goodsId || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?$/.test(time)) {
-        throw new HelperError('INCOMPLETE_RECORD', '评价身份或全文不可读取，锁定/回复停止。');
+        throw new HelperError('INCOMPLETE_RECORD', '评价身份或全文不可读取，检查/回复停止。');
       }
       return { shop: shopName, order: orderValues[0], goodsId, time,
         key: recordKey({ order: orderValues[0], goodsId, time }) };
@@ -547,11 +548,6 @@
       }
       return data;
     }
-    function unresolved(records) {
-      const keys = new Set(records.map(rec => rec.key));
-      return Object.values(journal().entries).filter(entry => keys.has(ReviewDOM.recordKey(entry)) &&
-        ['submitting', 'submitted_unverified'].includes(entry.status));
-    }
     function previous(rec, data = journal()) {
       // 旧版key含店铺名；用原记录字段兼容读取，不删除旧条目或核验依据。
       const entries = Object.values(data.entries).filter(entry => ReviewDOM.recordKey(entry) === rec.key);
@@ -571,7 +567,14 @@
       rec.status = status;
       rec.evidence = evidence;
     }
-    const saveBatch = batch => write(sessionStorage, Config.batchKey, batch);
+    function saveBatch(batch) {
+      batch.summary = {
+        checked: batch.records.length,
+        replied: batch.records.filter(rec => rec.status === 'confirmed').length,
+        skipped: batch.records.filter(rec => rec.status?.startsWith('skipped_')).length,
+      };
+      write(sessionStorage, Config.batchKey, batch);
+    }
     const lastBatch = () => read(sessionStorage, Config.batchKey, null);
     function resolve(key, verdict, note) {
       if (Actions.status().busy) throw new HelperError('BUSY', '批次执行期间不能修改台账。');
@@ -601,7 +604,7 @@
       anchor.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
-    return Object.freeze({ read, write, remove, journal, unresolved, previous, submission, saveBatch, lastBatch, resolve, exportData });
+    return Object.freeze({ read, write, remove, journal, previous, submission, saveBatch, lastBatch, resolve, exportData });
   })();
 
   const Results = (() => {
@@ -664,77 +667,16 @@
         }
       }
     }
-    async function freeze(batch, options) {
-      await first(options);
-      const keys = new Set();
-      const initialTotal = ReviewDOM.page().total;
-      const limit = batch.params.n ?? Infinity;
-      batch.initialTotal = initialTotal;
-      batch.maxCapturedPage = 1;
-      while (batch.records.length < limit) {
-        options.guard();
-        const page = ReviewDOM.page();
-        if (page.number > Config.maxPages || page.total !== initialTotal) {
-          throw new HelperError('RESULTS_CHANGED', '收集期间总数变化或分页超出保护上限，未开始回复。');
-        }
-        const groups = ReviewDOM.groups();
-        const take = Math.min(groups.length, limit - batch.records.length);
-        for (const group of groups.slice(0, take)) {
-          const rec = ReviewDOM.record(group, batch.shop);
-          if (keys.has(rec.key)) throw new HelperError('DUPLICATE_RECORD', '锁定范围内存在重复评价身份，未开始回复。');
-          if (batch.params.goodsId && rec.goodsId !== batch.params.goodsId) {
-            throw new HelperError('GOODS_FILTER_MISMATCH', '查询结果包含其他商品，未开始回复。');
-          }
-          keys.add(rec.key);
-          batch.records.push({ ...rec, rank: batch.records.length + 1, capturedPage: page.number, status: 'pending' });
-        }
-        batch.maxCapturedPage = page.number;
-        Ledger.saveBatch(batch);
-        Actions.update({ message: `正在锁定查询结果：${batch.records.length}条，第${page.number}页。` });
-        if (batch.records.length >= limit || !ReviewDOM.canTurn(page.next)) break;
-        if (!groups.length) throw new HelperError('INCONSISTENT_EMPTY_PAGE', '空页仍可翻页，分页结构需核查。');
-        await turn('next', options);
+    // 每次只读取当前页。身份用于去重及提交前核对，不预采集或跨页找固定记录。
+    function nextRecord(seen, shop) {
+      const records = ReviewDOM.groups().map(group => ReviewDOM.record(group, shop));
+      const keys = records.map(rec => rec.key);
+      if (new Set(keys).size !== keys.length) {
+        throw new HelperError('DUPLICATE_RECORD', '当前页存在重复评价身份，已停止。');
       }
-      const expected = initialTotal === null ? null : Math.min(limit, initialTotal);
-      if (expected !== null && batch.records.length !== expected) {
-        throw new HelperError('INCOMPLETE_SCOPE', `应锁定${expected}条，实际${batch.records.length}条；未开始回复。`);
-      }
-      batch.frozenAt = new Date().toISOString();
-      Ledger.saveBatch(batch);
-      await first(options);
-      // 冻结是跨页读取；提交前再校验原始前缀，发现采集期间重排则不执行回复。
-      for (let number = 1; number <= batch.maxCapturedPage; number++) {
-        options.guard();
-        if (ReviewDOM.page().total !== initialTotal) {
-          throw new HelperError('RESULTS_CHANGED', '冻结核查时结果总数变化，未开始回复。');
-        }
-        const expectedPage = batch.records.filter(rec => rec.capturedPage === number);
-        const currentGroups = ReviewDOM.groups().slice(0, expectedPage.length);
-        const current = currentGroups.map(group => ReviewDOM.record(group, batch.shop));
-        if (current.length !== expectedPage.length || current.some((rec, index) =>
-          rec.key !== expectedPage[index].key || rec.content !== expectedPage[index].content)) {
-          throw new HelperError('RESULTS_REORDERED', '锁定过程中原始前缀变化，未开始回复；请重新查询。');
-        }
-        if (number < batch.maxCapturedPage && !await turn('next', options)) {
-          throw new HelperError('INCOMPLETE_SCOPE', '冻结核查不能到达原始页。');
-        }
-      }
-      await first(options);
+      return records.find(rec => !seen.has(rec.key)) || null;
     }
-    async function locate(rec, batch, options) {
-      // 只在最初捕获的页范围内核对身份，绝不扩展N或改拿当前第N条。
-      await stable(options);
-      await first(options);
-      while (true) {
-        options.guard();
-        const group = ReviewDOM.find(rec);
-        if (group) return group;
-        const page = ReviewDOM.page();
-        if (page.number >= batch.maxCapturedPage || !ReviewDOM.canTurn(page.next)) return null;
-        await turn('next', options);
-      }
-    }
-    return Object.freeze({ stable, transition, freeze, locate });
+    return Object.freeze({ stable, transition, first, turn, nextRecord });
   })();
 
   const Replies = (() => {
@@ -801,6 +743,7 @@
           description: '等待本次回复成功证据' });
         Ledger.submission(rec, 'confirmed', successEvidence);
         Ledger.saveBatch(batch);
+        Actions.update({ message: `已检查${batch.summary.checked}条；确认回复${batch.summary.replied}条；跳过${batch.summary.skipped}条。` });
         await Wait.until(() => !ReviewDOM.modals().length,
           { ...options, description: '等待已成功回复的弹框关闭' });
         await Results.stable(options);
@@ -867,44 +810,63 @@
           if (!DOM.enabled(button)) throw new HelperError('QUERY_DISABLED', '查询按钮不可点击。');
           button.click();
         }, options, 1);
-        batch.phase = 'freezing';
-        await Results.freeze(batch, options);
-        // 未知提交只阻止包含原身份的锁定范围，不以店铺名封锁其他店铺/订单。
-        if (Ledger.unresolved(batch.records).length) {
-          throw new HelperError('UNRESOLVED_HISTORY', '锁定范围包含未知提交记录，需先人工核验对应台账，未开始本批回复。');
-        }
+        await Results.first(options);
+        batch.initialTotal = ReviewDOM.page().total;
+        batch.mode = 'sequential';
         batch.phase = 'replying';
         Ledger.saveBatch(batch);
-        for (const rec of batch.records) {
+        const seen = new Set();
+        let turns = 0;
+        const turn = async direction => {
+          if (++turns > Config.maxPages) throw new HelperError('PAGE_LIMIT', '翻页次数超过保护上限，批次停止。');
+          return Results.turn(direction, options);
+        };
+        while (batch.records.length < (p.n ?? Infinity)) {
           options.guard();
-          Actions.update({ message: `锁定${batch.records.length}条；正在检查第${rec.rank}条，订单${rec.order}。` });
+          await Results.stable(options);
+          const current = Results.nextRecord(seen, shop);
+          if (!current) {
+            const page = ReviewDOM.page();
+            if (!ReviewDOM.canTurn(page.next)) break;
+            if (!ReviewDOM.groups().length) throw new HelperError('INCONSISTENT_EMPTY_PAGE', '空页仍可翻页，分页结构需核查。');
+            await turn('next');
+            continue;
+          }
+          if (p.goodsId && current.goodsId !== p.goodsId) {
+            throw new HelperError('GOODS_FILTER_MISMATCH', '查询结果包含其他商品，已停止。');
+          }
+          const rec = { ...current, rank: batch.records.length + 1,
+            checkedPage: ReviewDOM.page().number, status: 'pending' };
+          seen.add(rec.key);
+          batch.records.push(rec);
+          Ledger.saveBatch(batch);
+          Actions.update({ message: `正在检查第${rec.rank}${p.n ? `/${p.n}` : ''}条，订单${rec.order}；已确认回复${batch.summary.replied}条。` });
           const prior = Ledger.previous(rec);
           if (prior && ['submitting', 'submitted_unverified'].includes(prior.status)) {
             throw new HelperError('UNRESOLVED_HISTORY', '当前记录存在未知提交，需先人工核验，未重复发送。');
           }
           if (prior?.status === 'confirmed') {
             rec.status = 'skipped_previously_confirmed';
+          } else if (!ReviewDOM.eligible(rec.content)) {
+            rec.status = 'skipped_non_template';
           } else {
-            const group = await Results.locate(rec, batch, options);
-            if (!group) rec.status = 'skipped_missing_locked_record';
-            else {
-              const current = ReviewDOM.record(group, shop);
-              if (current.content !== rec.content) throw new HelperError('RECORD_CHANGED', '锁定记录正文已变化，停止而不替换记录。');
-              // 完全匹配：不trim、不提取局部、不将手写评价视为模板。
-              if (!ReviewDOM.eligible(current.content)) rec.status = 'skipped_non_template';
-              else await Replies.submit(rec, batch, options);
-            }
+            await Replies.submit(rec, batch, options);
           }
           Ledger.saveBatch(batch);
+          Actions.update({ message: `已检查${batch.summary.checked}${p.n ? `/${p.n}` : ''}条；确认回复${batch.summary.replied}条；跳过${batch.summary.skipped}条。` });
+          // 未回复列表收缩会把后页记录移到前页；重新扫描可避免漏查，seen排除已检查身份。
+          // 不寻找刚才的记录；达到N立即结束，不为回复数量继续补查。
+          if (rec.status === 'confirmed' && batch.records.length < (p.n ?? Infinity)) {
+            while (ReviewDOM.page().number > 1) {
+              if (!await turn('prev')) throw new HelperError('CANNOT_RETURN_FIRST', '回复后不能返回第一页，已停止。');
+            }
+          }
         }
-        const replied = batch.records.filter(rec => rec.status === 'confirmed').length;
-        const skipped = batch.records.filter(rec => rec.status.startsWith('skipped_')).length;
         batch.phase = 'completed';
         batch.completedAt = new Date().toISOString();
-        batch.summary = { checked: batch.records.length, replied, skipped };
         Ledger.saveBatch(batch);
         Actions.update({ tone: 'success',
-          message: `批次完成：锁定检查${batch.records.length}条，确认回复${replied}条，跳过${skipped}条。${p.n ? `N=${p.n}，未补位。` : '已遍历全部查询结果。'}` });
+          message: `批次完成：检查${batch.summary.checked}条，确认回复${batch.summary.replied}条，跳过${batch.summary.skipped}条。${p.n ? `检查上限N=${p.n}。` : '已遍历当前查询结果。'}` });
         return { ok: true, ...batch.summary, batch };
       } catch (error) {
         batch.phase = 'stopped';
@@ -918,11 +880,9 @@
       Ledger.write(sessionStorage, Config.pendingKey, { schema: 3, action: 'start-batch',
         sourceUrl: location.href, params: p, at: Date.now() });
       navigating = true;
-      Actions.update({ busy: true, tone: 'info', message: '正在重新加载评价页，随后自动执行…' });
+      Actions.update({ busy: true, tone: 'info', message: '正在进入评价页，随后自动执行…' });
       try {
-        // 当前就是目标地址时也必须重新加载；同标签页，不创建新窗口。
-        if (location.href === Config.evaluationUrl) location.reload();
-        else location.assign(Config.evaluationUrl);
+        location.assign(Config.evaluationUrl);
       } catch (error) {
         Ledger.remove(sessionStorage, Config.pendingKey);
         navigating = false;
@@ -932,7 +892,7 @@
       return { navigating: true };
     }
     async function oneClickRun(value) {
-      return navigate(params(value));
+      return start(value);
     }
     function cancel() {
       // 先同步中断本页等待，再清除跳转交接；即使存储失败也不继续当前批次。
@@ -949,7 +909,7 @@
       }
       return stopped || navigating || hadPending;
     }
-    // 本页编排兼容接口；由消费后的导航任务调用，避免再次刷新形成循环。
+    // 已在评价路径直接操作，保留URL参数及页面日期；其他后台页面同标签页跳转。
     async function start(value) {
       const p = params(value);
       if (navigating || Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
@@ -1005,6 +965,74 @@
     let shadow;
     let lastRender = '';
     let checkedAt = '';
+    let drag;
+    let layout = readLayout();
+    function readLayout() {
+      try {
+        const value = JSON.parse(localStorage.getItem(Config.panelKey) || 'null');
+        if (value?.schema === 1 && ['expanded', 'collapsed', 'minimized'].includes(value.mode) &&
+            (value.x === null && value.y === null || Number.isFinite(value.x) && Number.isFinite(value.y))) {
+          return { schema: 1, mode: value.mode, x: value.x, y: value.y };
+        }
+      } catch { /* 面板偏好失效不影响业务台账。 */ }
+      return { schema: 1, mode: 'expanded', x: null, y: null };
+    }
+    function saveLayout() {
+      try { localStorage.setItem(Config.panelKey, JSON.stringify(layout)); } catch { /* 使用内存中的布局。 */ }
+    }
+    function place() {
+      if (!host?.isConnected) return;
+      const rect = host.getBoundingClientRect();
+      const maxX = Math.max(8, innerWidth - rect.width - 8);
+      const maxY = Math.max(8, innerHeight - rect.height - 8);
+      const x = Math.min(maxX, Math.max(8, layout.x ?? innerWidth - rect.width - 20));
+      const y = Math.min(maxY, Math.max(8, layout.y ?? innerHeight - rect.height - 24));
+      host.style.left = `${x}px`;
+      host.style.top = `${y}px`;
+      host.style.right = 'auto';
+      host.style.bottom = 'auto';
+      if (layout.x !== null) { layout.x = x; layout.y = y; }
+    }
+    function applyLayout() {
+      const section = shadow.querySelector('section');
+      section.dataset.mode = layout.mode;
+      shadow.querySelector('#body').hidden = layout.mode !== 'expanded';
+      shadow.querySelector('#drag-handle').hidden = layout.mode === 'minimized';
+      shadow.querySelector('#minibar').hidden = layout.mode !== 'minimized';
+      shadow.querySelector('#compact').hidden = layout.mode === 'expanded';
+      const toggle = shadow.querySelector('#collapse');
+      toggle.textContent = layout.mode === 'collapsed' ? '展开' : '收起';
+      toggle.setAttribute('aria-expanded', String(layout.mode === 'expanded'));
+      place();
+    }
+    function setMode(mode) {
+      layout.mode = mode;
+      applyLayout();
+      saveLayout();
+    }
+    function beginDrag(event) {
+      if (event.button !== 0 || !event.isPrimary ||
+          event.composedPath().some(node => node instanceof Element && node.matches('button, input, summary'))) return;
+      const rect = host.getBoundingClientRect();
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    }
+    function moveDrag(event) {
+      if (!drag || event.pointerId !== drag.id) return;
+      layout.x = drag.left + event.clientX - drag.x;
+      layout.y = drag.top + event.clientY - drag.y;
+      place();
+    }
+    function endDrag(event) {
+      if (!drag || event.pointerId !== drag.id) return;
+      drag = null;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      saveLayout();
+    }
+    function resize() { place(); saveLayout(); }
 
     // 观察入口只读取筛选和本机批次快照，不触发点击、查询或提交。
     function inspection() {
@@ -1022,15 +1050,17 @@
         if (state.otherSelected.length) message += `\n冲突条件：${state.otherSelected.join('、')}。`;
         const batch = Ledger.lastBatch();
         if (batch && Array.isArray(batch.records)) {
-          const phases = { querying: '筛选与查询', freezing: '锁定检查范围',
+          const phases = { querying: '筛选与查询', freezing: '旧版锁定检查范围',
             replying: '逐条检查与回复', completed: '已完成', stopped: '已停止' };
           const records = batch.records;
           const replied = records.filter(rec => rec.status === 'confirmed').length;
           const skipped = records.filter(rec => rec.status?.startsWith('skipped_')).length;
           const uncertain = records.filter(rec =>
             ['submitting', 'submitted_unverified'].includes(rec.status)).length;
+          const checked = batch.mode === 'sequential' ? records.length : replied + skipped;
+          const limit = batch.mode === 'sequential' ? batch.params.n ?? '全部' : records.length;
           message += `\n最近批次：${phases[batch.phase] || '未知阶段'}。`
-            + `\n已检查${replied + skipped}/${records.length}条；确认回复${replied}条；跳过${skipped}条。`;
+            + `\n已检查${checked}/${limit}条；确认回复${replied}条；跳过${skipped}条。`;
           if (uncertain) message += `\n待核验提交：${uncertain}条。`;
           if (batch.error?.message) message += `\n停止原因：${batch.error.message}`;
         } else message += '\n尚无批次记录。';
@@ -1054,10 +1084,21 @@
           * { box-sizing: border-box; }
           section { width: min(312px, calc(100vw - 24px)); color: #202534; background: #fff;
             border: 1px solid #e3e5eb; border-radius: 12px; box-shadow: 0 8px 28px #19233d26; overflow: hidden; }
-          header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px;
-            background: #fff5f4; border-bottom: 1px solid #f2dedc; }
+          header { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 10px;
+            background: #fff5f4; border-bottom: 1px solid #f2dedc; cursor: grab; touch-action: none; user-select: none; }
+          header:active, #minibar:active { cursor: grabbing; }
           strong { font-size: 14px; font-weight: 700; }
-          .version { font-size: 11px; color: #737c8c; }
+          .version { display: block; font-size: 11px; color: #737c8c; }
+          .window-tools { display: flex; gap: 4px; }
+          .window-tools button { font-size: 11px; padding: 4px 6px; }
+          section[data-mode="minimized"] { width: min(208px, calc(100vw - 24px)); }
+          #minibar { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px;
+            background: #fff5f4; cursor: grab; touch-action: none; user-select: none; }
+          #minibar strong { font-size: 12px; }
+          #compact { padding: 8px 10px; }
+          #compact-count { margin: 0 0 6px; font-size: 12px; overflow-wrap: anywhere; }
+          #compact-count[data-tone="error"] { color: #b32c22; }
+          #compact-stop { width: 100%; color: #b32c22; border-color: #c43a30; background: #fff5f4; }
           button { font: inherit; cursor: pointer; border: 1px solid #dce0e7; background: #fff;
             color: #303746; border-radius: 7px; padding: 6px 9px; }
           button:hover:enabled { border-color: #e02e24; background: #fff5f4; }
@@ -1085,7 +1126,17 @@
           #reply-copy { margin: 6px 0 0; overflow-wrap: anywhere; }
         </style>
         <section aria-label="PDD评价自动回复">
-          <header><strong>PDD 评价自动回复</strong><span class="version">${Config.version}</span></header>
+          <header id="drag-handle" title="拖动标题栏移动面板">
+            <div><strong>PDD 评价自动回复</strong><span class="version">${Config.version}</span></div>
+            <div class="window-tools">
+              <button id="collapse" type="button" aria-controls="body" aria-expanded="true">收起</button>
+              <button id="minimize" type="button" aria-label="最小化控制面板">最小化</button>
+            </div>
+          </header>
+          <div id="minibar" hidden title="拖动此处移动面板"><strong>PDD 评价助手</strong>
+            <button id="restore" type="button" aria-label="恢复控制面板">恢复</button></div>
+          <div id="compact" hidden><p id="compact-count" role="status" aria-live="polite"></p>
+            <button id="compact-stop" type="button">急停</button></div>
           <div id="body">
             <label for="batch-n">检查数量 N（留空＝全部结果）</label>
             <input id="batch-n" type="text" inputmode="numeric" placeholder="例如 5；N不是回复数量">
@@ -1101,7 +1152,7 @@
             </div>
             <p id="inspection" role="status" aria-live="polite"></p>
             <details id="reply-details"><summary>查看统一回复文案</summary><p id="reply-copy"></p></details>
-            <p class="hint">可从后台任意页面启动，自动进入评价页查询并回复。N留空处理全部结果。</p>
+            <p class="hint">评价页直接运行，其他后台页自动跳转。逐条检查，符合正文条件立即回复；N留空遍历结果。</p>
           </div>
         </section>`;
       shadow.querySelector('#run-once').addEventListener('click', () => {
@@ -1112,6 +1163,27 @@
       shadow.querySelector('#stop').addEventListener('click', () => {
         try { Workflow.cancel(); } catch (error) { Actions.update({ tone: 'error', message: error.message }); }
       });
+      shadow.querySelector('#compact-stop').addEventListener('click', () => {
+        try { Workflow.cancel(); } catch (error) { Actions.update({ tone: 'error', message: error.message }); }
+      });
+      shadow.querySelector('#collapse').addEventListener('click', () =>
+        setMode(layout.mode === 'collapsed' ? 'expanded' : 'collapsed'));
+      shadow.querySelector('#minimize').addEventListener('click', () => {
+        setMode('minimized');
+        shadow.querySelector('#restore').focus();
+      });
+      shadow.querySelector('#restore').addEventListener('click', () => {
+        setMode('expanded');
+        shadow.querySelector('#minimize').focus();
+      });
+      for (const handle of [shadow.querySelector('#drag-handle'), shadow.querySelector('#minibar')]) {
+        handle.addEventListener('pointerdown', beginDrag);
+        handle.addEventListener('pointermove', moveDrag);
+        handle.addEventListener('pointerup', endDrag);
+        handle.addEventListener('pointercancel', endDrag);
+        handle.addEventListener('lostpointercapture', endDrag);
+      }
+      shadow.querySelector('#reply-details').addEventListener('toggle', place);
       shadow.querySelector('#refresh').addEventListener('click', () => {
         checkedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         render();
@@ -1121,6 +1193,8 @@
       });
       shadow.querySelector('#reply-copy').textContent = Config.replyText;
       document.body.append(host);
+      applyLayout();
+      window.addEventListener('resize', resize);
       lastRender = '';
     }
 
@@ -1142,10 +1216,20 @@
       const details = shadow.querySelector('#inspection');
       details.textContent = reading.message;
       details.dataset.tone = reading.tone;
+      const batch = Ledger.lastBatch();
+      const counts = batch?.summary;
+      const compact = shadow.querySelector('#compact-count');
+      const label = status.busy ? '运行中' : batch?.phase === 'stopped' ? '已停止'
+        : batch?.phase === 'completed' ? '已完成' : '待运行';
+      compact.textContent = `${label}${counts ? ` · 检查${counts.checked} · 回复${counts.replied}` : ''}`;
+      compact.dataset.tone = status.tone;
+      place();
     }
 
     function destroy() {
       host?.remove();
+      window.removeEventListener('resize', resize);
+      drag = null;
       host = null;
       shadow = null;
       lastRender = '';

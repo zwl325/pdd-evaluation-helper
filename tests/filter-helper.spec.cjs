@@ -133,7 +133,7 @@ async function main() {
   });
   test('面板保留一键运行、下方急停、检查状态、导出台账和文案入口', 'normal', async page => {
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('button').count(), 4);
+    assert.equal(await panel.locator('#body button').count(), 4);
     assert.equal(await panel.locator('#run-once').innerText(), '一键运行');
     assert.equal(await panel.locator('#stop').innerText(), '急停');
     assert.equal(await panel.locator('#stop').isDisabled(), false);
@@ -142,7 +142,8 @@ async function main() {
     assert.equal(await panel.locator('#refresh').innerText(), '检查状态');
     assert.equal(await panel.locator('#export-batch').innerText(), '导出本机台账');
     assert.equal(await panel.locator('summary').innerText(), '查看统一回复文案');
-    assert.equal(await panel.locator('.badge, [data-select], #all, #collapse').count(), 0);
+    assert.equal(await panel.locator('.badge, [data-select], #all').count(), 0);
+    assert.equal(await panel.locator('#collapse').innerText(), '收起');
     const before = await panel.locator('#status').innerText();
     await panel.locator('#refresh').click();
     assert.match(await panel.locator('#inspection').innerText(), /找到3\/3项，已选0\/3项/);
@@ -155,6 +156,78 @@ async function main() {
     if (process.env.PDD_TEST_SCREENSHOT) {
       await page.screenshot({ path: process.env.PDD_TEST_SCREENSHOT, fullPage: true });
     }
+  });
+  test('收起和展开整个面板内容，保留紧凑状态与急停，不触发业务', 'normal', async page => {
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#collapse').click();
+    assert.equal(await panel.locator('#body').isVisible(), false);
+    assert.equal(await panel.locator('#collapse').getAttribute('aria-expanded'), 'false');
+    assert.equal(await panel.locator('#compact-stop').isVisible(), true);
+    assert.match(await panel.locator('#compact-count').innerText(), /待运行/);
+    await panel.locator('#collapse').focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await panel.locator('#body').isVisible(), true);
+    assert.equal(await panel.locator('#collapse').getAttribute('aria-expanded'), 'true');
+    assert.deepEqual(await counts(page), expectedCounts(0, 0, 0));
+  });
+  test('最小化后恢复面板，参数与文案展开状态保留', 'normal', async page => {
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#batch-n').fill('5');
+    await panel.locator('summary').click();
+    await panel.locator('#minimize').click();
+    assert.equal(await panel.locator('#body').isVisible(), false);
+    assert.equal(await panel.locator('#drag-handle').isVisible(), false);
+    assert.equal(await panel.locator('#minibar').isVisible(), true);
+    assert.equal(await panel.locator('#compact-stop').isVisible(), true);
+    assert.ok((await panel.boundingBox()).width < 250);
+    await page.keyboard.press('Enter');
+    assert.equal(await panel.locator('#body').isVisible(), true);
+    assert.equal(await panel.locator('#batch-n').inputValue(), '5');
+    assert.equal(await panel.locator('#reply-copy').isVisible(), true);
+    assert.deepEqual(await counts(page), expectedCounts(0, 0, 0));
+  });
+  test('拖动标题栏移动面板，屏幕边缘限制位置，刷新保存布局', 'normal', async page => {
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    const before = await panel.boundingBox();
+    const header = await panel.locator('#drag-handle strong').boundingBox();
+    await page.mouse.move(header.x + 10, header.y + 10);
+    await page.mouse.down();
+    await page.mouse.move(header.x - 250, header.y - 200, { steps: 8 });
+    await page.mouse.up();
+    const moved = await panel.boundingBox();
+    assert.ok(moved.x < before.x - 150);
+    assert.ok(moved.y < before.y - 100);
+    await panel.locator('#collapse').click();
+    const saved = await panel.boundingBox();
+    await page.reload();
+    await page.addScriptTag({ content: source });
+    assert.equal(await panel.locator('#body').isVisible(), false);
+    const restored = await panel.boundingBox();
+    assert.ok(Math.abs(restored.x - saved.x) < 1 && Math.abs(restored.y - saved.y) < 1);
+    const restoredHeader = await panel.locator('#drag-handle strong').boundingBox();
+    await page.mouse.move(restoredHeader.x + 10, restoredHeader.y + 10);
+    await page.mouse.down();
+    await page.mouse.move(-300, -300, { steps: 8 });
+    await page.mouse.up();
+    const clamped = await panel.boundingBox();
+    assert.ok(clamped.x >= 8 && clamped.y >= 8);
+    assert.deepEqual(await counts(page), expectedCounts(0, 0, 0));
+  });
+  test('最小化位置可拖动，缩小窗口后恢复面板仍在可视范围', 'normal', async page => {
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#minimize').click();
+    const handle = await panel.locator('#minibar strong').boundingBox();
+    await page.mouse.move(handle.x + 10, handle.y + 8);
+    await page.mouse.down();
+    await page.mouse.move(1090, 770, { steps: 8 });
+    await page.mouse.up();
+    await page.setViewportSize({ width: 360, height: 420 });
+    await panel.locator('#restore').click();
+    const rect = await panel.boundingBox();
+    assert.ok(rect.x >= 0 && rect.y >= 0);
+    assert.ok(rect.x + rect.width <= 360 && rect.y + rect.height <= 420);
+    assert.equal(await panel.locator('#stop').isVisible(), true);
+    assert.deepEqual(await counts(page), expectedCounts(0, 0, 0));
   });
   test('急停按钮中断筛选等待，运行期间始终可点击', 'noop', async page => {
     await page.evaluate(() => {

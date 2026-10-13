@@ -33,10 +33,13 @@ async function enableNavigationInjection(page) {
 
 async function clickRunAndWait(page) {
   const previousBatchId = await page.evaluate(() => window.PDDEvaluationHelper?.readBatch()?.id || null);
-  const navigation = page.waitForEvent('framenavigated', { predicate: frame => frame === page.mainFrame() });
+  const alreadyHere = /^\/goods\/evaluation\/index\/?$/.test(new URL(page.url()).pathname);
+  const originalUrl = page.url();
+  const navigation = alreadyHere ? null :
+    page.waitForEvent('framenavigated', { predicate: frame => frame === page.mainFrame() });
   await page.locator('#pdd-evaluation-helper-panel').locator('#run-once').click();
-  await navigation;
-  assert.equal(page.url(), evaluationUrl);
+  if (navigation) await navigation;
+  assert.equal(page.url(), alreadyHere ? originalUrl : evaluationUrl);
   await page.waitForFunction(previousId => {
     const batch = window.PDDEvaluationHelper?.readBatch();
     return batch?.phase === 'completed' && batch.id !== previousId;
@@ -55,7 +58,7 @@ async function main() {
     assert.equal(s.queries, 0);
     assert.equal(s.submissions.length, 0);
   });
-  test('N=3先跨页锁定3条，检查3条仅回复2条；收缩不补位', 'normal', async page => {
+  test('N=3逐条立即回复，检查3条仅回复2条；第一条回复前不翻页', 'normal', async page => {
     const result = await run(page, { n: 3 });
     assert.equal(result.ok, true, result.message);
     assert.deepEqual([result.checked, result.replied, result.skipped], [3, 2, 1]);
@@ -65,7 +68,9 @@ async function main() {
     assert.ok(s.submissions.every(rec => rec.value === replyText && rec.receivedInput === replyText));
     assert.equal(s.goods, '');
     assert.deepEqual(s.goodsEvents, ['']);
-    assert.ok(s.visited.some(visit => visit.page === 2 && visit.beforeSubmission));
+    assert.ok(s.visited.every(visit => !visit.beforeSubmission || visit.page === 1));
+    assert.equal(s.batch.frozenAt, undefined);
+    assert.equal(s.batch.mode, 'sequential');
   });
   test('N留空遍历全部6条，严格模板仅回复3条', 'normal', async page => {
     const result = await run(page);
@@ -74,7 +79,9 @@ async function main() {
     const s = await state(page);
     assert.equal(s.submissions.length, 3);
     assert.ok(!s.opens.includes('990000-000000004'), '带尾部空白不应打开回复');
-    assert.ok(s.visited.some(visit => visit.page === 3 && visit.beforeSubmission));
+    assert.ok(s.visited.every(visit => !visit.beforeSubmission || visit.page === 1));
+    assert.deepEqual(s.batch.records.map(rec => rec.order).sort(), Array.from({ length: 6 }, (_, i) =>
+      `990000-00000000${i + 1}`));
   });
   test('N不是回复配额，N=2不会向后补找', 'normal', async page => {
     const result = await run(page, { n: 2 });
@@ -95,11 +102,32 @@ async function main() {
     assert.equal(result.batch.records[0].status, 'skipped_non_template');
     assert.equal((await state(page)).opens.length, 0);
   });
-  test('锁定记录消失时标记缺失，不补入后面的模板记录', 'missing-locked', async page => {
+  test('短句该用户觉得商品很好全文匹配可回复，成功计数加1', 'normal', async page => {
+    await page.evaluate(() => { window.sim.records[0].content = '该用户觉得商品很好'; });
+    const result = await run(page, { n: 1 });
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual(result.batch.summary, { checked: 1, replied: 1, skipped: 0 });
+    assert.deepEqual((await state(page)).submissions.map(rec => rec.order), ['990000-000000001']);
+    assert.equal(result.batch.records[0].content, '该用户觉得商品很好');
+  });
+  test('短句附加内容、空白、换行或其他星级均不触发回复', 'normal', async page => {
+    for (const content of ['该用户觉得商品很好 ', '该用户觉得商品很好\n', '该用户觉得商品很好，值得推荐',
+      '前缀该用户觉得商品很好', '该用户觉得商品很好，给出了3星好评', '该用户觉得商品较好']) {
+      await page.evaluate(content => { window.sim.records[0].content = content; }, content);
+      const result = await run(page, { n: 1 });
+      assert.equal(result.ok, true, result.message);
+      assert.equal(result.replied, 0, content);
+      assert.equal(result.checked, 1);
+    }
+    assert.equal((await state(page)).submissions.length, 0);
+    assert.equal((await state(page)).opens.length, 0);
+  });
+  test('未检查记录消失后直接读取当前列表，计满N即停', 'missing-locked', async page => {
     const result = await run(page, { n: 3 });
     assert.equal(result.ok, true, result.message);
     assert.deepEqual([result.checked, result.replied, result.skipped], [3, 1, 2]);
-    assert.equal(result.batch.records[2].status, 'skipped_missing_locked_record');
+    assert.equal(result.batch.records[2].status, 'skipped_non_template');
+    assert.equal(result.batch.records[2].order, '990000-000000004');
     assert.deepEqual((await state(page)).submissions.map(rec => rec.order), ['990000-000000001']);
   });
   test('没有成功提示时对应记录的完整回复回显可确认', 'echo', async page => {
@@ -107,6 +135,15 @@ async function main() {
     assert.equal(result.ok, true, result.message);
     assert.equal(result.replied, 1);
     assert.equal(result.batch.records[0].evidence, 'record_reply_echo');
+  });
+  test('已回复记录仍留在列表时去重继续，全量跨页不重复提交', 'echo', async page => {
+    const result = await run(page);
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual([result.checked, result.replied, result.skipped], [6, 3, 3]);
+    const s = await state(page);
+    assert.equal(s.submissions.length, 3);
+    assert.equal(new Set(s.batch.records.map(rec => rec.key)).size, 6);
+    assert.ok(s.batch.records.filter(rec => rec.status === 'confirmed').every(rec => rec.evidence === 'record_reply_echo'));
   });
   test('指定商品ID通过input事件填写并限制结果', 'normal', async page => {
     const result = await run(page, { goodsId: '9001' });
@@ -122,7 +159,7 @@ async function main() {
     assert.equal(result.ok, true, result.message);
     assert.deepEqual([result.checked, result.replied, result.skipped], [0, 0, 0]);
   });
-  test('N超过总数时只锁定实际全部记录', 'normal', async page => {
+  test('N超过总数时只检查实际全部记录', 'normal', async page => {
     const result = await run(page, { n: 99 });
     assert.equal(result.checked, 6);
     assert.equal(result.replied, 3);
@@ -131,12 +168,28 @@ async function main() {
     assert.equal((await run(page, { n: 1 })).code, 'TIMEOUT');
     assert.equal((await state(page)).submissions.length, 0);
   });
-  test('冻结跨页身份重复，提交前停止', 'duplicate', async page => {
-    assert.equal((await run(page)).code, 'DUPLICATE_RECORD');
-    assert.equal((await state(page)).submissions.length, 0);
+  test('跨页重复出现的身份按计数去重，不重复检查或发送', 'duplicate', async page => {
+    const result = await run(page);
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual([result.checked, result.replied, result.skipped], [5, 2, 3]);
+    const s = await state(page);
+    assert.equal(new Set(s.submissions.map(rec => rec.order)).size, s.submissions.length);
   });
-  test('锁定期间前缀重排，复核失败不提交', 'reorder-freeze', async page => {
-    assert.equal((await run(page, { n: 3 })).code, 'RESULTS_REORDERED');
+  test('回复后列表重排，按当前顺序继续，不找原先固定记录', 'normal', async page => {
+    await page.evaluate(() => document.body.addEventListener('click', event => {
+      if (event.target.matches('[data-tracking-click-viewid="reply_btn"]') && window.sim.submissions.length === 1) {
+        window.sim.records.reverse();
+      }
+    }));
+    const result = await run(page, { n: 3 });
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual([result.checked, result.replied, result.skipped], [3, 2, 1]);
+    assert.deepEqual(result.batch.records.map(rec => rec.order),
+      ['990000-000000001', '990000-000000006', '990000-000000005']);
+  });
+  test('当前页评价身份重复时停止，不向重复目标回复', 'normal', async page => {
+    await page.evaluate(() => { window.sim.records[1] = { ...window.sim.records[0] }; });
+    assert.equal((await run(page)).code, 'DUPLICATE_RECORD');
     assert.equal((await state(page)).submissions.length, 0);
   });
   test('身份时间不完整时停止', 'bad-time', async page => {
@@ -220,7 +273,7 @@ async function main() {
     assert.equal((await run(page, { n: 1 })).code, 'UNRESOLVED_HISTORY');
     s = await state(page);
     assert.equal(s.submissions.length, 1);
-    assert.equal(s.queries, 2, '先查询并锁定，再按记录身份核验未知历史');
+    assert.equal(s.queries, 2, '先查询，再逐条核验未知历史');
   });
   test('旧成功提示不能确认本次未验证提交', 'stale-toast', async page => {
     assert.equal((await run(page, { n: 1 })).code, 'SUBMITTED_UNVERIFIED');
@@ -280,7 +333,7 @@ async function main() {
     assert.equal(await page.evaluate(key =>
       window.PDDEvaluationHelper.readSubmissionJournal().entries[key].evidence, oldKey), 'legacy_success');
   });
-  test('旧版未知台账命中锁定记录时，开始回复前停止，不重发也不先回复其他条', 'normal', async page => {
+  test('逐条遇到旧版未知提交时停止，保留前面已成功的回复', 'normal', async page => {
     await page.evaluate(() => {
       const rec = window.sim.records[2];
       const key = JSON.stringify(['旧测试店铺', rec.order, rec.goodsId, rec.time]);
@@ -293,10 +346,11 @@ async function main() {
     const s = await state(page);
     assert.equal(s.queries, 1);
     assert.equal(s.batch.records.length, 3);
-    assert.equal(s.opens.length, 0);
-    assert.equal(s.submissions.length, 0);
+    assert.equal(s.opens.length, 1);
+    assert.deepEqual(s.submissions.map(rec => rec.order), ['990000-000000001']);
+    assert.deepEqual(s.batch.summary, { checked: 3, replied: 1, skipped: 1 });
   });
-  test('其他店铺或其他订单的未知历史不阻止当前锁定范围', 'normal', async page => {
+  test('其他店铺或其他订单的未知历史不阻止当前记录', 'normal', async page => {
     await page.evaluate(() => {
       const rec = { shop: '另一个测试店铺', order: '992000-000000001', goodsId: '9999',
         time: '2026-10-01 10:00:00', status: 'submitted_unverified' };
@@ -369,7 +423,7 @@ async function main() {
     assert.equal(await panel.locator('#status').getAttribute('data-tone'), 'info');
     assert.equal(await page.evaluate(() => Object.keys(window.PDDEvaluationHelper.readSubmissionJournal().entries).length), 0);
   });
-  test('急停锁定期间的翻页等待，未锁定完毕不开始回复', 'normal', async page => {
+  test('急停逐条遍历的翻页等待，停止后不继续处理', 'normal', async page => {
     await page.evaluate(() => {
       document.getElementById('results').addEventListener('click', event => {
         if (event.target.getAttribute('data-testid') !== 'beast-core-pagination-next') return;
@@ -377,16 +431,16 @@ async function main() {
         document.querySelector('[data-testid="beast-core-table"]').setAttribute('aria-busy', 'true');
         window.freezePaused = true;
       }, true);
-      window.pending = window.PDDEvaluationHelper.startBatch({ n: 3 }).catch(error => ({ code: error.code }));
+      window.pending = window.PDDEvaluationHelper.startBatch({}).catch(error => ({ code: error.code }));
     });
     await page.waitForFunction(() => window.freezePaused);
     await page.locator('#pdd-evaluation-helper-panel').locator('#stop').click();
     assert.equal((await page.evaluate(() => window.pending)).code, 'CANCELLED');
     const s = await state(page);
-    assert.equal(s.batch.records.length, 2);
+    assert.equal(s.batch.records.length, 4);
     assert.equal(s.batch.phase, 'stopped');
-    assert.equal(s.opens.length, 0);
-    assert.equal(s.submissions.length, 0);
+    assert.equal(s.opens.length, 2);
+    assert.equal(s.submissions.length, 2);
   });
   test('急停已填写但尚未提交的回复，保留草稿且零提交', 'normal', async page => {
     await page.evaluate(() => {
@@ -450,20 +504,20 @@ async function main() {
     assert.equal((await run(page, { goodsId: 'ID: 9001' })).code, 'INVALID_GOODS_ID');
     assert.equal((await state(page)).queries, 0);
   });
-  test('一键运行先刷新到指定地址，再筛选查询回复；保留检查状态', 'normal', async page => {
+  test('评价路径直接筛选查询回复，保留URL和页面状态及检查入口', 'normal', async page => {
     await enableNavigationInjection(page);
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('button').count(), 4);
+    assert.equal(await panel.locator('#body button').count(), 4);
     await panel.locator('#batch-n').fill('2');
     await page.evaluate(() => { window.beforeReloadMarker = true; });
     await clickRunAndWait(page);
     const s = await state(page);
-    assert.equal(await page.evaluate(() => window.beforeReloadMarker), undefined);
+    assert.equal(await page.evaluate(() => window.beforeReloadMarker), true);
     assert.equal(s.queries, 1);
     assert.equal(s.submissions.length, 1);
     assert.deepEqual(await page.evaluate(() => window.sim.filterClicks), ['4星', '5星', '未回复']);
     assert.equal(await panel.locator('#batch-n').inputValue(), '2');
-    assert.equal(await panel.locator('button').count(), 4);
+    assert.equal(await panel.locator('#body button').count(), 4);
     assert.equal(await panel.locator('#run-once').isDisabled(), false);
     await panel.locator('#refresh').click();
     assert.match(await panel.locator('#inspection').innerText(), /已检查2\/2条；确认回复1条；跳过1条/);
@@ -561,7 +615,7 @@ async function main() {
     assert.equal(s.queries, 1);
     assert.equal(s.submissions.length, 1);
   });
-  test('已在完全相同的目标地址也刷新，当前标签页只加载一次', 'normal', async (page, context) => {
+  test('已在完全相同的目标地址直接运行，零导航且保留页面状态', 'normal', async (page, context) => {
     await enableNavigationInjection(page);
     await page.goto(evaluationUrl);
     const panel = page.locator('#pdd-evaluation-helper-panel');
@@ -571,8 +625,8 @@ async function main() {
     page.on('framenavigated', frame => { if (frame === page.mainFrame()) navigations++; });
     const initialTabs = context.pages().length;
     await clickRunAndWait(page);
-    assert.equal(await page.evaluate(() => window.beforeReloadMarker), undefined);
-    assert.equal(navigations, 1, '不能产生重复刷新循环');
+    assert.equal(await page.evaluate(() => window.beforeReloadMarker), true);
+    assert.equal(navigations, 0, '评价页不应刷新或跳转');
     assert.equal(context.pages().length, initialTabs, '必须复用当前标签页');
     assert.equal((await state(page)).submissions.length, 1);
     assert.equal(await page.evaluate(() => sessionStorage.getItem('pdd-evaluation-helper:pending:v1')), null);
@@ -604,7 +658,7 @@ async function main() {
     assert.deepEqual((await state(page)).batch.summary, { checked: 1, replied: 0, skipped: 1 });
     assert.equal((await state(page)).submissions.length, 0);
   });
-  test('一键刷新后保留N和指定商品ID，不丢失参数', 'normal', async page => {
+  test('一键直接运行使用N和指定商品ID，不丢失参数', 'normal', async page => {
     await enableNavigationInjection(page);
     const panel = page.locator('#pdd-evaluation-helper-panel');
     await panel.locator('#batch-n').fill('1');
@@ -637,6 +691,7 @@ async function main() {
   });
   test('急停清除跳转期间的任务，目标页加载后不自动执行', 'normal', async page => {
     await enableNavigationInjection(page);
+    await page.goto('https://mms.pinduoduo.com/home/');
     await page.evaluate(() => {
       const panel = document.getElementById('pdd-evaluation-helper-panel').shadowRoot;
       panel.getElementById('batch-n').value = '1';
@@ -724,6 +779,24 @@ async function main() {
     await panel.locator('#refresh').click();
     assert.match(await panel.locator('#inspection').innerText(), /已停止/);
     assert.match(await panel.locator('#inspection').innerText(), /停止原因/);
+  });
+  test('运行中收起和最小化不影响任务，紧凑面板可急停并显示计数', 'query-noop', async page => {
+    await page.evaluate(() => {
+      window.pending = window.PDDEvaluationHelper.oneClickRun({ n: 1 }).catch(error => ({ code: error.code }));
+    });
+    await page.waitForFunction(() => window.sim.queries === 1);
+    const panel = page.locator('#pdd-evaluation-helper-panel');
+    await panel.locator('#collapse').click();
+    assert.equal(await panel.locator('#body').isVisible(), false);
+    assert.match(await panel.locator('#compact-count').innerText(), /运行中 · 检查0 · 回复0/);
+    await panel.locator('#minimize').click();
+    assert.equal(await panel.locator('#compact-stop').isDisabled(), false);
+    await panel.locator('#compact-stop').click();
+    assert.equal((await page.evaluate(() => window.pending)).code, 'CANCELLED');
+    assert.match(await panel.locator('#compact-count').innerText(), /已停止 · 检查0 · 回复0/);
+    assert.equal((await state(page)).submissions.length, 0);
+    await panel.locator('#restore').click();
+    assert.equal(await panel.locator('#run-once').isDisabled(), false);
   });
   test('损坏、过期或缺少检查范围的导航标记不启动全部回复', 'normal', async page => {
     const valid = { schema: 3, action: 'start-batch', sourceUrl: 'https://mms.pinduoduo.com/goods/manage',
