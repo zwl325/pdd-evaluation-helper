@@ -1,6 +1,6 @@
 # PDD 评价自动回复与举报助手
 
-版本：**2026-10-14.4**。脚本名称为 **PDD评价筛选助手 v2026-10-14.4**。名称中的版本随发布同步生成；`@namespace`、安装文件名及更新地址保持固定。
+版本：**2026-10-14.5**。脚本名称为 **PDD评价筛选助手 v2026-10-14.5**。名称中的版本随发布同步生成；`@namespace`、安装文件名及更新地址保持固定。
 
 UI/UX 与生命周期管理的后续计划见 [TODO.md](TODO.md)；本次严重 bug 与隐患检查见 [REVIEW-NOTES.md](REVIEW-NOTES.md)，其中两项 P1 风险仍待处理。
 
@@ -58,9 +58,21 @@ UI/UX 与生命周期管理的后续计划见 [TODO.md](TODO.md)；本次严重 
 
 点击“一键运行”后，脚本在原批次互斥锁内先只读当前页状态，连续稳定后可将匹配的`submitting`／`submitted_unverified`确认为已受理；还需原尝试的文案与举报原因符合当前配置，并保留原尝试ID、日期、旧`TIMEOUT`等历史，不再提交该记录。不会为核验先点击筛选、查询、翻页，也不会根据截图内容硬编码订单。不可见或无法确认的记录继续待核验，阻止后续提交。
 
+2026-10-14.5将当前页核验的稳定判据与分页读取分开：仅核验当前可见评价时，不需要读取页码，但仍等待表格加载结束及内容稳定。即使没有可读页码，恢复已达到本次目标时也能结束；还需处理新记录时必须先确认分页状态，失败则保留已恢复计数及历史、停止新提交。
+
 本次恢复中**当天且符合本次商品条件**的成功记录计入本次成功目标；例如填写2时，恢复1条后仅再新增1条。前日恢复或其他商品恢复只修正历史，不占当前目标。日额度只把原占用从待核验转为成功，不重复占用；当天30条全被占用时仍可核验，零新增提交。安装、刷新注入、切换模式和“检查状态”仍只读，不自动核验或提交。过去批次快照不回写；本次结果以新批次的`reconciled`和`recovered`字段记录。
 
 提交后将`submissionDiagnostics`保存在记录及尝试台账中；未知结果同时写入`batch.error.details`。包含弹框数量、是否捕获新成功提示、对应记录是否找到、正文／星级、受理文字、可见举报入口数、记录读取错误、可识别通知区原文和底层等待错误。通知原文仅采集可见`role=alert/status`或带toast/message测试标记的区域，不是全部页面提示的保证。
+
+核验未找到对应记录时，新增`list`诊断，包含当前可见记录数量、最多20个候选订单／商品／评价时间及截断标记。`observedAt`用于区分本次观察与历史诊断；在本次列表稳定读取之前就出错时，历史尝试里的旧诊断仍可能保留，应同时看本次批次错误及两个时间。
+
+### 分页读取与诊断
+
+两种模式共用`ReviewPagination`。先核对唯一可见的`PGT_pagerItemActive`或`aria-current=page`标记，同时兼容交接目录历史DOM中的分页器属性`data-status="beast-core-pagination-10-1"`，其中10为每页条数、1为当前页。没有可见高亮标记时可依据该完整组件状态读取页码；两种证据同时存在时必须一致。
+
+多个可见标记、页码冲突、非法数字、无法读取的组件状态或页码超出总数范围均停止，不取第一个或猜测第一页；没有分页器时保留原单页流程。分页失败随两种模式的批次导出`error.details`，包含`stage=pagination`、原因、观察时间、分页器数量／可见性、组件状态、高亮候选，以及最多4个分页器各16000字符的`outerHTML`片段。
+
+2026-10-14.4现场台账证明高亮页码读取失败，但没有保存该时刻的分页器DOM，无法仅凭日志区分结构变化、隐藏状态或加载时序。上述属性格式有历史DOM依据，当前现场仍需运行验收；未确认的结构继续停止并留下诊断。
 
 ### 原始评价时间与重复节点
 
@@ -219,6 +231,7 @@ window.PDDEvaluationHelper.resolveSubmission(
 | `Actions` | 独立筛选和批次共用的执行锁、状态通知 |
 | `ReviewDOM` | 查询输入、评价身份、页码、弹框、结果证据及可选店铺备注 |
 | `ReviewTime` | 原始评价时间、重复节点合并、追评／商家回复时间排除及候选诊断 |
+| `ReviewPagination` | 高亮页码与分页组件状态交叉核对、方向按钮及分页失败诊断 |
 | `Ledger` | 批次快照、提交前落盘、历史状态和人工核验 |
 | `Results` | 查询完成、稳定判据、翻页和当前页未检查身份读取 |
 | `Replies` | 精确填文、单次提交、明确成功证据、未知结果停止 |
@@ -231,7 +244,7 @@ window.PDDEvaluationHelper.resolveSubmission(
 
 定位依据为用户提供的《Tampermonkey-点击动作DOM定位清单.md》、交接文件中的历史DOM信息及2026-10-14的《定位元素.txt》。公开仓库只保存选择器和合成夹具，不上传原始DOM文件中的业务数据。与已有定位不同的地方主要是：
 
-- 分页增加上一页`beast-core-pagination-prev`，用`PGT_pagerItemActive`读取实际页码，用`PGT_totalText`读取总数。
+- 分页增加上一页`beast-core-pagination-prev`；用`PGT_pagerItemActive`／`aria-current=page`及历史DOM中的`data-status`交叉读取实际页码，用`PGT_totalText`读取总数。
 - “回复/互动”兼容半角`/`与全角`／`，仍限制在对应身份分组内。
 - 去除强制店铺识别和店铺名称一致性校验；历史页头结构仅用于尝试读取台账备注，缺失或不唯一时留空。
 - 成功提示同时观察节点添加和文本变化，清除上一条提示后再开始本次提交。
@@ -281,13 +294,13 @@ window.PDDEvaluationHelper.exportReportLedger();
 | `@updateURL` | [pdd-evaluation-filter.meta.js](https://raw.githubusercontent.com/zwl325/pdd-evaluation-helper/main/pdd-evaluation-filter.meta.js) |
 | `@downloadURL` | [pdd-evaluation-filter.user.js](https://raw.githubusercontent.com/zwl325/pdd-evaluation-helper/main/pdd-evaluation-filter.user.js) |
 
-检查周期由Tampermonkey设置决定。旧版2026-10-12尚无更新源，需要通过安装链接更新一次；后续已配置更新源的版本可在原脚本上执行“检查更新”，再刷新已打开的PDD后台页面，面板版本显示`2026-10-14.4`即可确认当前页面已加载本版。
+检查周期由Tampermonkey设置决定。旧版2026-10-12尚无更新源，需要通过安装链接更新一次；后续已配置更新源的版本可在原脚本上执行“检查更新”，再刷新已打开的PDD后台页面，面板版本显示`2026-10-14.5`即可确认当前页面已加载本版。
 
 本版按需求把版本加入`@name`。若手动打开安装链接后Tampermonkey提示新增另一个脚本，请先停用旧副本，或在原脚本编辑器中替换代码；确保只有一个副本启用，避免两个实例同时运行。仅保持命名空间不作为手动安装一定原位更新的保证。
 
 ## 版本管理与发布
 
-使用日期式版本 **`YYYY-MM-DD.N`**：日期取发布当天，同一天从`.1`开始递增；例如本次为`2026-10-14.4`，当天后续发布为`.5`，次日首次发布为`2026-10-15.1`。沿用已有日期式版本序列，避免切换到较小的新版本号影响更新比较。Tampermonkey官方文档说明`@version`用于更新检查，每次更新都应递增，并给出了日期式版本示例。
+使用日期式版本 **`YYYY-MM-DD.N`**：日期取发布当天，同一天从`.1`开始递增；例如本次为`2026-10-14.5`，当天后续发布为`.6`，次日首次发布为`2026-10-15.1`。沿用已有日期式版本序列，避免切换到较小的新版本号影响更新比较。Tampermonkey官方文档说明`@version`用于更新检查，每次更新都应递增，并给出了日期式版本示例。
 
 `@version`是唯一版本来源。不要手动分别维护名称、运行时版本与元数据；执行升版命令后，工具同时生成：
 
@@ -298,7 +311,7 @@ window.PDDEvaluationHelper.exportReportLedger();
 例如下次同日发布，运行以下命令；其他日期替换成当次发布版本：
 
 ```text
-node scripts/sync-metadata.cjs --version 2026-10-14.5
+node scripts/sync-metadata.cjs --version 2026-10-14.6
 node scripts/sync-metadata.cjs --check
 node tests/metadata.spec.cjs
 node --check pdd-evaluation-filter.user.js
@@ -314,6 +327,7 @@ node tests/batch-workflow.spec.cjs
 node tests/report-workflow.spec.cjs
 node tests/record-time.spec.cjs
 node tests/report-acceptance.spec.cjs
+node tests/pagination.spec.cjs
 ```
 
 检查通过后更新[CHANGELOG.md](CHANGELOG.md)，使用`git`提交并推送到`main`；以同一提交创建`v<@version>`标签和GitHub Release，附上主脚本与元数据文件及发布说明。已发布标签和版本不覆盖，修正需要新版本。GitHub Actions检查语法、名称/版本/元数据一致性及10项版本工具测试；浏览器流程测试在本机运行。

@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-14.4
+// @name         PDD评价筛选助手 v2026-10-14.5
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-14.4
+// @version      2026-10-14.5
 // @description  PDD自动筛选回复与差评举报双模式，支持独立计数、每日举报限额、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-14.4',
+    version: '2026-10-14.5',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -447,6 +447,75 @@
     return Object.freeze({ read });
   })();
 
+  const ReviewPagination = (() => {
+    const all = (selector, root = DOM.root() || document) => [...root.querySelectorAll(selector)];
+    const text = element => (element.innerText || '').trim();
+    function diagnostics(issue = '') {
+      const containers = all(Config.selectors.pagination);
+      return { stage: 'pagination', issue, observedAt: new Date().toISOString(),
+        selector: Config.selectors.pagination, activeSelector: Config.selectors.activePage,
+        candidateCount: containers.length, visibleCount: containers.filter(DOM.visible).length,
+        containers: containers.slice(0, 4).map(element => ({
+          visible: DOM.visible(element), className: String(element.className),
+          dataStatus: element.getAttribute('data-status'),
+          activeCandidates: all(Config.selectors.activePage, element).slice(0, 20).map(candidate => ({
+            visible: DOM.visible(candidate), text: text(candidate), className: String(candidate.className),
+            ariaCurrent: candidate.getAttribute('aria-current') })),
+          outerHTML: element.outerHTML.slice(0, 16000),
+        })) };
+    }
+    function fail(code, message, issue) {
+      throw Object.assign(new HelperError(code, message), { details: diagnostics(issue) });
+    }
+    function read() {
+      const found = all(Config.selectors.pagination).filter(DOM.visible);
+      if (!found.length) return { number: 1, total: null, next: null, prev: null, source: 'no_paginator', size: null };
+      if (found.length !== 1) fail('PAGE_AMBIGUOUS', '评价分页器不唯一，已停止。', 'multiple_paginators');
+      const pagination = found[0];
+      const active = all(Config.selectors.activePage, pagination).filter(DOM.visible);
+      if (active.length > 1) fail('PAGE_AMBIGUOUS', '当前页码存在多个可见标记，已停止。', 'multiple_active_markers');
+      const activeText = active.length ? text(active[0]) : '';
+      const markerNumber = activeText && /^[1-9]\d*$/.test(activeText) ? Number(activeText) : null;
+      if (active.length && !Number.isSafeInteger(markerNumber)) {
+        fail('PAGE_UNREADABLE', '当前高亮页码不可读取，已停止。', 'invalid_active_marker');
+      }
+      // 交接历史分页DOM：data-status="beast-core-pagination-10-1"（每页条数-当前页）。
+      // 仅接受该完整格式；有高亮页码时必须一致，不推测第一页或借用跳页输入框。
+      const rawStatus = pagination.getAttribute('data-status') || '';
+      const status = /^beast-core-pagination-([1-9]\d*)-([1-9]\d*)$/.exec(rawStatus);
+      const size = status ? Number(status[1]) : null;
+      const statusNumber = status ? Number(status[2]) : null;
+      if (rawStatus.startsWith('beast-core-pagination-') &&
+          (!status || !Number.isSafeInteger(size) || !Number.isSafeInteger(statusNumber))) {
+        fail('PAGE_UNREADABLE', '分页组件状态中的条数或页码不可确认，已停止。', 'invalid_component_status');
+      }
+      if (markerNumber !== null && statusNumber !== null && markerNumber !== statusNumber) {
+        fail('PAGE_AMBIGUOUS', '高亮页码与分页组件状态不一致，已停止。', 'conflicting_page_evidence');
+      }
+      const number = markerNumber ?? statusNumber;
+      if (number === null) {
+        fail('PAGE_UNREADABLE', '当前页码无可见标记且分页组件状态不可读取，已停止。', 'missing_page_evidence');
+      }
+      const totals = all(Config.selectors.total, pagination).filter(DOM.visible);
+      if (totals.length > 1) fail('PAGE_AMBIGUOUS', '分页结果总数不唯一，已停止。', 'multiple_totals');
+      const totalMatch = totals.length && /共(?:有)?\s*([\d,]+)\s*条/.exec(text(totals[0]));
+      const total = totalMatch ? Number(totalMatch[1].replace(/,/g, '')) : null;
+      if (total !== null && (!Number.isSafeInteger(total) || total < 0 ||
+          size !== null && number > Math.max(1, Math.ceil(total / size)))) {
+        fail('PAGE_UNREADABLE', '分页页码或总数超出可确认范围，已停止。', 'page_out_of_range');
+      }
+      const arrow = direction => {
+        const elements = all(`[data-testid="beast-core-pagination-${direction}"]`, pagination).filter(DOM.visible);
+        if (elements.length > 1) fail('PAGE_AMBIGUOUS', '分页方向按钮不唯一，已停止。', `multiple_${direction}_buttons`);
+        return elements[0] || null;
+      };
+      return { number, total, next: arrow('next'), prev: arrow('prev'), size,
+        source: markerNumber !== null ? statusNumber !== null ? 'active_marker_and_component_status'
+          : 'active_marker' : 'component_status' };
+    }
+    return Object.freeze({ read, diagnostics });
+  })();
+
   const ReviewDOM = (() => {
     const all = (selector, root = document) => [...root.querySelectorAll(selector)];
     const text = (element) => (element?.innerText || '').trim();
@@ -524,24 +593,27 @@
       if (matches.length > 1) throw new HelperError('DUPLICATE_RECORD', '当前页评价身份重复，已停止。');
       return matches[0] || null;
     }
-    function page() {
-      const pagination = one(Config.selectors.pagination, '评价分页器', DOM.root() || document, true);
-      if (!pagination) return { number: 1, total: null, next: null, prev: null };
-      const current = one(Config.selectors.activePage, '当前页码', pagination);
-      const number = Number(text(current));
-      const totalText = one(Config.selectors.total, '结果总数', pagination, true);
-      const totalMatch = totalText && /共(?:有)?\s*([\d,]+)\s*条/.exec(text(totalText));
-      const total = totalMatch ? Number(totalMatch[1].replace(/,/g, '')) : null;
-      if (!Number.isSafeInteger(number) || number < 1) throw new HelperError('PAGE_UNREADABLE', '当前页码不可读取。');
-      const arrow = direction => one(`[data-testid="beast-core-pagination-${direction}"]`,
-        `${direction}分页按钮`, pagination, true);
-      return { number, total, next: arrow('next'), prev: arrow('prev') };
-    }
+    const page = ReviewPagination.read;
     const canTurn = (element) => Boolean(element && DOM.enabled(element) && !/PGT_disabled/.test(element.className));
     function busy() {
       const root = DOM.root();
       return !root || !table(true) || all(Config.selectors.loading, root).some(DOM.visible) ||
         /加载中|正在加载/.test(text(table()));
+    }
+    function tableFingerprint() {
+      return JSON.stringify({ text: table().innerText, groups: groups().map(group => group.innerText) });
+    }
+    function listDiagnostics() {
+      const values = table(true) ? groups() : [];
+      return { visibleRecordCount: values.length, truncated: values.length > 20,
+        identities: values.slice(0, 20).map(group => {
+          try {
+            const { order, goodsId, time } = identity(group);
+            return { order, goodsId, time };
+          } catch (error) {
+            return { error: { code: error.code || error.name, message: error.message, details: error.details } };
+          }
+        }) };
     }
     function fingerprint() {
       const p = page();
@@ -578,7 +650,8 @@
         element.innerText === Config.replyText && !element.closest(Config.selectors.content));
     }
     return Object.freeze({ all, text, one, shopLabel, form, goods, queryButton, setValue,
-      filterSignature, recordKey, record, eligible, table, groups, find, page, canTurn, busy, fingerprint, empty,
+      filterSignature, recordKey, record, eligible, table, groups, find, page, canTurn, busy,
+      tableFingerprint, listDiagnostics, fingerprint, empty,
       replyLink, modals, modal, successMessages, replyEcho });
   })();
 
@@ -685,6 +758,18 @@
   })();
 
   const Results = (() => {
+    async function currentTableStable(options) {
+      let last;
+      return Wait.until(() => {
+        if (ReviewDOM.busy()) { last = undefined; return false; }
+        const signature = ReviewDOM.tableFingerprint();
+        if (signature !== last) { last = signature; return false; }
+        if (!ReviewDOM.groups().length &&
+            !/暂无(?:数据|评价|相关记录)|没有(?:评价|数据|相关记录)|无查询结果/.test(ReviewDOM.text(ReviewDOM.table()))) return false;
+        return { signature };
+      }, { ...options, timeoutMs: Config.resultTimeoutMs, stableMs: Config.resultStableMs,
+        description: '等待当前可见评价列表稳定以核验举报' });
+    }
     async function stable(options, description = '等待评价结果稳定') {
       let last;
       return Wait.until(() => {
@@ -753,7 +838,7 @@
       }
       return records.find(rec => !seen.has(rec.key)) || null;
     }
-    return Object.freeze({ stable, transition, first, turn, nextRecord });
+    return Object.freeze({ currentTableStable, stable, transition, first, turn, nextRecord });
   })();
 
   const Replies = (() => {
@@ -1075,8 +1160,9 @@
           data.status = acceptedStatus(group);
         }
       } catch (error) {
-        data.rowError = { code: error.code || error.name, message: error.message };
+        data.rowError = { code: error.code || error.name, message: error.message, details: error.details };
       }
+      if (!data.rowFound) data.list = ReviewDOM.listDiagnostics();
       data.evidence = data.modalCount === 0 && data.contentMatches &&
         data.actualStar === rec.star && data.status?.accepted ? 'record_report_accepted'
         : data.modalCount === 0 && freshSuccess ? 'fresh_report_success' : '';
@@ -1202,12 +1288,13 @@
       if (!uncertain.length) return [];
       await Wait.until(() => ReviewDOM.table(true),
         { ...options, timeoutMs: Config.resultTimeoutMs, description: '等待核验待确认举报的当前列表' });
-      await Results.stable(options);
+      await Results.currentTableStable(options);
       let signature;
       const observations = await Wait.until(() => {
+        if (ReviewDOM.busy()) { signature = undefined; return false; }
         const values = uncertain.map(entry => ({ id: entry.id,
           reading: ReportDOM.submissionState({ ...entry, content: Config.reportContent }) }));
-        const current = JSON.stringify(values);
+        const current = JSON.stringify({ table: ReviewDOM.tableFingerprint(), values });
         if (current !== signature) { signature = current; return false; }
         return values;
       }, { ...options, description: '核验同一评价的已举报待审核状态' });
@@ -1331,7 +1418,7 @@
       const options = job.options;
       const batch = { id: crypto.randomUUID(), version: Config.version, taskMode: 'report',
         startedAt: new Date().toISOString(), day: ReportLedger.day(), shop: '',
-        params: p, target: 0, star: 1, phase: 'querying', records: [] };
+        params: p, target: 0, star: 1, phase: 'reconciling', records: [] };
       ReportLedger.saveBatch(batch);
       const originalGuard = options.guard;
       let filterSignature;
