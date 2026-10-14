@@ -23,6 +23,7 @@ jobs:
           node --check tests/filter-helper.spec.cjs
           node --check tests/batch-workflow.spec.cjs
           node --check tests/report-workflow.spec.cjs
+          node --check tests/record-time.spec.cjs
           node --check tests/metadata.spec.cjs
       - name: Check version and update metadata
         run: node scripts/sync-metadata.cjs --check

@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-14.2
+// @name         PDD评价筛选助手 v2026-10-14.3
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-14.2
+// @version      2026-10-14.3
 // @description  PDD自动筛选回复与差评举报双模式，支持独立计数、每日举报限额、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-14.2',
+    version: '2026-10-14.3',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -385,6 +385,68 @@
     });
   })();
 
+  const ReviewTime = (() => {
+    const format = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?$/;
+    const sectionLabel = /^(追评|追加评价|商家回复)[：:]?$/;
+    function role(element, wrapper) {
+      // 原始正文仍按交接约定取firstElementChild；正文里的样式节点不用于身份。
+      const content = wrapper.firstElementChild;
+      if (element === content || content?.contains(element)) return 'inside_content';
+      for (let parent = element.parentElement; parent && parent !== wrapper; parent = parent.parentElement) {
+        if (/(?:^|\s)logic_replyWrapper(?:_|$|\s)/.test(parent.className)) return 'merchant_reply';
+        const label = parent.firstElementChild;
+        if (label && !label.contains(element) && DOM.visible(label)) {
+          const match = sectionLabel.exec((label.innerText || '').trim());
+          if (match) return match[1] === '商家回复' ? 'merchant_reply' : 'additional_review';
+        }
+      }
+      return 'original_candidate';
+    }
+    function path(element, wrapper) {
+      const parts = [];
+      for (let node = element; node && node !== wrapper; node = node.parentElement) {
+        parts.unshift(`${node.tagName.toLowerCase()}:nth-child(${
+          [...node.parentElement.children].indexOf(node) + 1})`);
+      }
+      return parts.join(' > ');
+    }
+    function read(wrapper, identity) {
+      const nodes = [...wrapper.querySelectorAll(Config.selectors.time)];
+      const candidates = nodes.filter(DOM.visible).map(element => {
+        const rawText = element.innerText || '';
+        const value = rawText.trim();
+        return { text: rawText, value, valid: format.test(value), role: role(element, wrapper),
+          path: path(element, wrapper), tag: element.tagName.toLowerCase(),
+          className: String(element.className), parentClass: String(element.parentElement.className) };
+      });
+      const primary = candidates.filter(candidate => candidate.role === 'original_candidate');
+      const values = [...new Set(primary.map(candidate => candidate.value))];
+      const diagnostics = { stage: 'record_identity', field: 'time', ...identity,
+        selector: Config.selectors.time, candidateCount: nodes.length, visibleCount: candidates.length,
+        primaryCount: primary.length, ignoredCount: candidates.length - primary.length,
+        candidates, values, selectedTime: null, source: null, issue: '' };
+      let code, message;
+      if (!primary.length) {
+        code = 'RECORD_TIME_MISSING';
+        message = '原始评价时间未找到；候选节点已保存到本机台账。';
+        diagnostics.issue = 'no_original_time';
+      } else if (primary.some(candidate => !candidate.valid)) {
+        code = 'INCOMPLETE_RECORD';
+        message = '原始评价时间格式不可确认；候选文本已保存到本机台账。';
+        diagnostics.issue = 'invalid_time_text';
+      } else if (values.length !== 1) {
+        code = 'RECORD_TIME_AMBIGUOUS';
+        message = `原始评价时间有${values.length}个不同值，无法确认归属；候选节点已保存到本机台账。`;
+        diagnostics.issue = 'different_original_times';
+      }
+      if (code) throw Object.assign(new HelperError(code, message), { details: diagnostics });
+      diagnostics.selectedTime = values[0];
+      diagnostics.source = primary.length === 1 ? 'single_original_time' : 'same_value_duplicates';
+      return { value: values[0], diagnostics };
+    }
+    return Object.freeze({ read });
+  })();
+
   const ReviewDOM = (() => {
     const all = (selector, root = document) => [...root.querySelectorAll(selector)];
     const text = (element) => (element?.innerText || '').trim();
@@ -435,11 +497,13 @@
       const orderValues = [...new Set([...group.innerText.matchAll(/订单编号[：:]\s*([\d-]+)/g)].map(match => match[1]))];
       const goodsText = text(one('.goods-id', '评价商品ID', group));
       const goodsId = /^(?:ID|商品ID)\s*[：:]\s*(\d+)$/i.exec(goodsText)?.[1];
-      const time = text(one(Config.selectors.time, '评价时间', wrapper));
-      if (orderValues.length !== 1 || !goodsId || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?$/.test(time)) {
+      const reading = ReviewTime.read(wrapper, { order: orderValues.length === 1 ? orderValues[0] : null,
+        goodsId: goodsId || null });
+      const time = reading.value;
+      if (orderValues.length !== 1 || !goodsId) {
         throw new HelperError('INCOMPLETE_RECORD', '评价身份或全文不可读取，检查/回复停止。');
       }
-      return { shop: shopName, order: orderValues[0], goodsId, time,
+      return { shop: shopName, order: orderValues[0], goodsId, time, timeDiagnostics: reading.diagnostics,
         key: recordKey({ order: orderValues[0], goodsId, time }) };
     }
     function record(group, shopName) {
@@ -1427,6 +1491,7 @@
       } catch (error) {
         batch.phase = 'stopped';
         batch.error = { code: error.code || error.name, message: error.message };
+        if (error.details) batch.error.details = error.details;
         Ledger.saveBatch(batch);
         throw error;
       }

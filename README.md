@@ -1,6 +1,6 @@
 # PDD 评价自动回复与举报助手
 
-版本：**2026-10-14.2**。脚本名称为 **PDD评价筛选助手 v2026-10-14.2**。名称中的版本随发布同步生成；`@namespace`、安装文件名及更新地址保持固定。
+版本：**2026-10-14.3**。脚本名称为 **PDD评价筛选助手 v2026-10-14.3**。名称中的版本随发布同步生成；`@namespace`、安装文件名及更新地址保持固定。
 
 UI/UX 与生命周期管理的后续计划见 [TODO.md](TODO.md)；本次严重 bug 与隐患检查见 [REVIEW-NOTES.md](REVIEW-NOTES.md)，其中两项 P1 风险仍待处理。
 
@@ -51,6 +51,19 @@ UI/UX 与生命周期管理的后续计划见 [TODO.md](TODO.md)；本次严重 
 提交前的`submitting`和提交结果不明的`submitted_unverified`暂占额度，但不算成功数。任意日期存在未知举报时，新举报批次停止，需核验后继续；不能只凭弹框关闭、记录消失或超时记成功。运行跨北京时间日期时停止，重新运行才使用新日额度。状态区显示今日成功、待核验、剩余额度、本次目标、当前星级、检查数、成功数、跳过数和停止原因。
 
 用户提供的DOM包含举报弹框和输入元素，**尚未包含实际提交成功／失败提示或已举报状态样本**。当前成功文字及已举报状态为兼容定位，已通过合成页面测试，未在真实后台验证；如实际提示不同，脚本会保留未知提交并停止。后续应补充成功提示的`outerHTML`、selector和出现／消失方式。页面级提示还存在与评价身份不能直接关联的证据边界，见`REVIEW-NOTES.md`。
+
+### 原始评价时间与重复节点
+
+2026-10-14.3新增共用`ReviewTime`模块，修复正文容器内多个可见`logic_replyTime`节点造成“评价时间：找到2个可见目标。”的问题。回复与举报使用相同规则：
+
+- 原始正文仍按交接清单读取`firstElementChild.innerText`；正文内部的时间样式节点不用于评价身份。
+- 排除位于`logic_replyWrapper`容器内的商家回复时间；独立内容块以可见首元素精确标注“追评”“追加评价”或“商家回复”（可带冒号）时，排除其中的时间。不会用整条评价里出现这些词来判断。
+- 剩余候选均须符合既有时间格式；同一时间的兄弟或父子重复节点合并，保留原有首尾空白裁剪方式。两个不同时间不取第一个、不取最早或最晚，也不把分钟精度和秒精度自行合并。
+- 缺少原始时间报`RECORD_TIME_MISSING`；不同原始候选时间报`RECORD_TIME_AMBIGUOUS`；格式无法确认继续报`INCOMPLETE_RECORD`。不能确定归属时仍停止，不计成功或占用提交额度。
+
+成功读取的记录保存`timeDiagnostics`；失败即使发生在建记录之前，两种模式的`batch.error.details`也保存`stage=record_identity`、订单号、商品ID、候选总数／可见数／原始候选数、候选原文、分类、相对节点路径、样式类、不同时间值和失败原因。诊断只留在本机台账，随原导出按钮导出。
+
+评价身份仍为订单号、商品ID、原始评价时间；未更改台账键和历史去重方式。当前页任意记录仍存在无法确定的时间时，页面读取会停止。本次未取得发生错误时的实际多时间DOM；未标注的追评或其他不同时间结构需要依据新诊断继续核对，不能将合成页面通过描述为现场归属已确认。
 
 ### 星级核验与错误诊断
 
@@ -195,6 +208,7 @@ window.PDDEvaluationHelper.resolveSubmission(
 | `DOM` / `Wait` | 基础可见性、筛选定位、超时和取消 |
 | `Actions` | 独立筛选和批次共用的执行锁、状态通知 |
 | `ReviewDOM` | 查询输入、评价身份、页码、弹框、结果证据及可选店铺备注 |
+| `ReviewTime` | 原始评价时间、重复节点合并、追评／商家回复时间排除及候选诊断 |
 | `Ledger` | 批次快照、提交前落盘、历史状态和人工核验 |
 | `Results` | 查询完成、稳定判据、翻页和当前页未检查身份读取 |
 | `Replies` | 精确填文、单次提交、明确成功证据、未知结果停止 |
@@ -257,13 +271,13 @@ window.PDDEvaluationHelper.exportReportLedger();
 | `@updateURL` | [pdd-evaluation-filter.meta.js](https://raw.githubusercontent.com/zwl325/pdd-evaluation-helper/main/pdd-evaluation-filter.meta.js) |
 | `@downloadURL` | [pdd-evaluation-filter.user.js](https://raw.githubusercontent.com/zwl325/pdd-evaluation-helper/main/pdd-evaluation-filter.user.js) |
 
-检查周期由Tampermonkey设置决定。旧版2026-10-12尚无更新源，需要通过安装链接更新一次；后续已配置更新源的版本可在原脚本上执行“检查更新”，再刷新已打开的PDD后台页面，面板版本显示`2026-10-14.2`即可确认当前页面已加载本版。
+检查周期由Tampermonkey设置决定。旧版2026-10-12尚无更新源，需要通过安装链接更新一次；后续已配置更新源的版本可在原脚本上执行“检查更新”，再刷新已打开的PDD后台页面，面板版本显示`2026-10-14.3`即可确认当前页面已加载本版。
 
 本版按需求把版本加入`@name`。若手动打开安装链接后Tampermonkey提示新增另一个脚本，请先停用旧副本，或在原脚本编辑器中替换代码；确保只有一个副本启用，避免两个实例同时运行。仅保持命名空间不作为手动安装一定原位更新的保证。
 
 ## 版本管理与发布
 
-使用日期式版本 **`YYYY-MM-DD.N`**：日期取发布当天，同一天从`.1`开始递增；例如本次为`2026-10-14.2`，当天后续发布为`.3`，次日首次发布为`2026-10-15.1`。沿用已有日期式版本序列，避免切换到较小的新版本号影响更新比较。Tampermonkey官方文档说明`@version`用于更新检查，每次更新都应递增，并给出了日期式版本示例。
+使用日期式版本 **`YYYY-MM-DD.N`**：日期取发布当天，同一天从`.1`开始递增；例如本次为`2026-10-14.3`，当天后续发布为`.4`，次日首次发布为`2026-10-15.1`。沿用已有日期式版本序列，避免切换到较小的新版本号影响更新比较。Tampermonkey官方文档说明`@version`用于更新检查，每次更新都应递增，并给出了日期式版本示例。
 
 `@version`是唯一版本来源。不要手动分别维护名称、运行时版本与元数据；执行升版命令后，工具同时生成：
 
@@ -274,7 +288,7 @@ window.PDDEvaluationHelper.exportReportLedger();
 例如下次同日发布，运行以下命令；其他日期替换成当次发布版本：
 
 ```text
-node scripts/sync-metadata.cjs --version 2026-10-14.3
+node scripts/sync-metadata.cjs --version 2026-10-14.4
 node scripts/sync-metadata.cjs --check
 node tests/metadata.spec.cjs
 node --check pdd-evaluation-filter.user.js
@@ -288,6 +302,7 @@ node --check pdd-evaluation-filter.user.js
 node tests/filter-helper.spec.cjs
 node tests/batch-workflow.spec.cjs
 node tests/report-workflow.spec.cjs
+node tests/record-time.spec.cjs
 ```
 
 检查通过后更新[CHANGELOG.md](CHANGELOG.md)，使用`git`提交并推送到`main`；以同一提交创建`v<@version>`标签和GitHub Release，附上主脚本与元数据文件及发布说明。已发布标签和版本不覆盖，修正需要新版本。GitHub Actions检查语法、名称/版本/元数据一致性及10项版本工具测试；浏览器流程测试在本机运行。
