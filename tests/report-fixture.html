@@ -93,9 +93,11 @@
     s.page = Math.min(pages, s.page);
     const rows = records.slice((s.page - 1) * s.pageSize, s.page * s.pageSize).map(rec => `
       <div data-testid="beast-core-table-middle-tbody">
-        <div class="evaluation-item-header">评价分：${mode === 'table-colored' ? paintedStars(rec.star) : stars(rec.star)}</div>
+        <div class="evaluation-item-header">评价分：${mode === 'table-colored' ? paintedStars(rec.star) : stars(rec.star)}
+          ${rec.acceptedText && rec.statusPlacement !== 'body' ? `<span ${rec.statusHidden ? 'hidden' : ''}>${escapeText(rec.acceptedText)}</span>` : ''}</div>
         <div data-testid="beast-core-table-body-tr">
           <div class="logic_reviewWrapper_x"><div>${escapeText(rec.content)}</div><span class="logic_replyTime_x">${rec.time}</span></div>
+          ${rec.acceptedText && rec.statusPlacement === 'body' ? `<span>${escapeText(rec.acceptedText)}</span>` : ''}
           <div>订单编号：${rec.order}</div><div class="goods-id">ID: ${rec.goodsId}</div>
           <div data-tracking-click-viewid="report">${rec.reported ? '<span>已举报</span>' :
             `<a href="#" data-order="${rec.order}">举报</a>`}</div>
@@ -202,6 +204,32 @@
       s.submissions.push({ order, star: rec.star, value: input.value, receivedInput, receivedChange,
         reason: label.dataset.checked, reasonType: submit.getAttribute('data-tracking-click-params') });
       setTimeout(() => {
+        if (s.acceptanceScenario) {
+          const scenario = s.acceptanceScenario;
+          if (scenario !== 'keep-modal') modal.remove();
+          s.keepReported = true;
+          const target = scenario === 'other-row' ? s.records.find(value => value.order !== rec.order) : rec;
+          target.acceptedText = scenario === 'failed' ? '举报失败' : s.acceptanceText || '已举报，待审核';
+          target.reported = scenario !== 'link-still';
+          if (scenario === 'hidden') target.statusHidden = true;
+          if (scenario === 'body') target.statusPlacement = 'body';
+          if (scenario === 'wrong-identity') target.time = '2026-10-14 23:59:59';
+          if (scenario === 'wrong-star') target.star = 5;
+          window.renderFixture();
+          if (scenario === 'flash') setTimeout(() => {
+            target.acceptedText = ''; target.reported = false; window.renderFixture();
+          }, 120);
+          if (scenario === 'delayed') {
+            target.acceptedText = '';
+            window.renderFixture();
+            setTimeout(() => { target.acceptedText = '已举报，待审核'; window.renderFixture(); }, 450);
+          }
+          if (scenario === 'failed') {
+            document.querySelector('#toast').setAttribute('role', 'alert');
+            document.querySelector('#toast').textContent = '举报未受理，请稍后核实';
+          }
+          return;
+        }
         modal.remove();
         if (['unknown', 'stale-toast', 'cancel-after-submit'].includes(mode)) return;
         rec.reported = true;
