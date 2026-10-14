@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-14.1
+// @name         PDD评价筛选助手 v2026-10-14.2
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-14.1
+// @version      2026-10-14.2
 // @description  PDD自动筛选回复与差评举报双模式，支持独立计数、每日举报限额、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper

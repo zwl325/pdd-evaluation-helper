@@ -237,8 +237,8 @@ async function main() {
 
   for (const [mode, code] of [
     ['wrong-star', 'REPORT_STAR_MISMATCH'], ['wrong-modal', 'UNEXPECTED_REPORT_MODAL'],
-    ['modal-star', 'REPORT_RECORD_CHANGED'], ['modal-content', 'REPORT_RECORD_CHANGED'],
-    ['content-change', 'REPORT_RECORD_CHANGED'], ['identity-change', 'REPORT_RECORD_CHANGED'],
+    ['modal-star', 'REPORT_MODAL_STAR_MISMATCH'], ['modal-content', 'REPORT_MODAL_CONTENT_MISMATCH'],
+    ['content-change', 'REPORT_MODAL_CONTENT_MISMATCH'], ['identity-change', 'REPORT_RECORD_CHANGED'],
     ['filter-change', 'FILTER_CHANGED'], ['missing-reason', 'REPORT_REASON_UNAVAILABLE'],
     ['duplicate-reason', 'REPORT_REASON_UNAVAILABLE'], ['existing-text', 'EXISTING_REPORT_TEXT'],
     ['short-max', 'REPORT_TOO_LONG'], ['wrong-reason-id', 'TIMEOUT'], ['text-rejected', 'TIMEOUT'],
@@ -249,6 +249,115 @@ async function main() {
     assert.equal(result.code, code, result.message);
     assert.equal((await state(page)).submissions.length, 0);
     assert.equal((await state(page)).quota.used, 0);
+  });
+  test('固定5个SVG仅部分高亮，正确处理1至3星且不把灰星计入评分', 'normal', async page => {
+    const result = await run(page, { n: 4 });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.reported, 4);
+    assert.deepEqual((await state(page)).submissions.map(rec => rec.star), [1, 2, 2, 3]);
+    for (const rec of result.batch.records.filter(rec => rec.status === 'confirmed')) {
+      assert.equal(rec.reportDiagnostics.expectedStar, rec.star);
+      assert.equal(rec.reportDiagnostics.actualStar, rec.star);
+      assert.equal(rec.reportDiagnostics.rating.svgCount, 5);
+      assert.equal(rec.reportDiagnostics.rating.source, 'painted_stars');
+    }
+  });
+  for (const [mode, expectedSource, svgCount] of [
+    ['rating-aria', 'aria-valuenow', 5], ['rating-data', 'data-score', 5],
+    ['rating-classes', 'full_star_classes', 5], ['rating-layers', 'full_star_classes', 10],
+    ['rating-hidden', 'painted_stars', 10], ['table-colored', 'painted_stars', 5],
+  ]) test(`${mode}评分结构正确识别并只提交一次`, mode, async page => {
+    const result = await run(page, { n: 1 });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.reported, 1);
+    const rec = result.batch.records.find(rec => rec.status === 'confirmed');
+    assert.equal(rec.reportDiagnostics.actualStar, 1);
+    assert.equal(rec.reportDiagnostics.rating.source, expectedSource);
+    assert.equal(rec.reportDiagnostics.rating.svgCount, svgCount);
+    assert.equal((await state(page)).submissions.length, 1);
+  });
+  for (const mode of ['modal-delayed', 'modal-unstable', 'reason-delayed-rating']) {
+    test(`${mode}等待正文与评分稳定，加载中不选原因不填文不提交`, mode, async page => {
+      const result = await run(page, { n: 1 });
+      assert.equal(result.ok, true, result.message);
+      const s = await state(page);
+      assert.equal(s.submissions.length, 1);
+      assert.deepEqual(s.earlyActions, []);
+      assert.equal(s.batch.records.find(rec => rec.status === 'confirmed').reportDiagnostics.actualContent, template);
+    });
+  }
+  for (const [mode, issue] of [
+    ['rating-unknown', 'score_unreadable'], ['rating-zero', 'score_not_ready'],
+    ['rating-invalid', 'invalid_declared_score'], ['rating-conflict', 'conflicting_score_evidence'],
+    ['rating-half', 'partial_star'],
+  ]) test(`${mode}评分无法确认则停止，错误保存实际图标和阶段`, mode, async page => {
+    const result = await run(page, { n: 1 });
+    assert.equal(result.code, 'REPORT_MODAL_STAR_UNREADABLE', result.message);
+    const s = await state(page);
+    assert.equal(s.submissions.length, 0);
+    assert.equal(s.quota.used, 0);
+    const details = s.batch.error.details;
+    assert.equal(details.stage, 'opened');
+    assert.equal(details.expectedStar, 1);
+    assert.equal(details.actualStar, null);
+    assert.equal(details.expectedContent, template);
+    assert.equal(details.actualContent, template);
+    assert.equal(details.rating.issue, issue);
+    assert.ok(details.rating.svgCount >= 5);
+    assert.equal(s.batch.records[1].reportDiagnostics.rating.issue, issue);
+  });
+  test('弹框真实5星不伪装成1星；保存预期和实际评分', 'modal-star', async page => {
+    const result = await run(page, { n: 1 });
+    assert.equal(result.code, 'REPORT_MODAL_STAR_MISMATCH');
+    const s = await state(page);
+    assert.deepEqual([s.batch.error.details.expectedStar, s.batch.error.details.actualStar], [1, 5]);
+    assert.equal(s.batch.error.details.rating.svgCount, 5);
+    assert.equal(s.submissions.length, 0);
+  });
+  test('填写后正文变化仍停止；诊断记录最新阶段及未归一化原文', 'late-modal-content', async page => {
+    const result = await run(page, { n: 1 });
+    assert.equal(result.code, 'REPORT_MODAL_CONTENT_MISMATCH');
+    const s = await state(page);
+    assert.equal(s.batch.error.details.stage, 'text_filled');
+    assert.equal(s.batch.error.details.expectedContent, template);
+    assert.equal(s.batch.error.details.actualContent, '原文发生变化');
+    assert.equal(s.submissions.length, 0);
+    assert.equal(s.journal.attempts.length, 0);
+  });
+  test('弹框正文尾部换行不放宽匹配；导出台账包含完整错误诊断', 'modal-content', async page => {
+    await page.evaluate(template => {
+      const observer = new MutationObserver(() => {
+        const detail = document.querySelector('.comment-content .detail');
+        if (detail && detail.textContent !== template + '\n') detail.textContent = template + '\n';
+      });
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    }, template);
+    assert.equal((await run(page, { n: 1 })).code, 'REPORT_MODAL_CONTENT_MISMATCH');
+    const [download] = await Promise.all([page.waitForEvent('download'), panel(page).locator('#report-export-batch').click()]);
+    const exported = JSON.parse(fs.readFileSync(await download.path(), 'utf8'));
+    assert.equal(exported.batch.error.details.actualContent, template + '\n');
+    assert.equal(exported.batch.error.details.expectedContent, template);
+    assert.equal(exported.batch.error.details.actualStar, 1);
+    assert.equal(exported.batch.records[1].reportDiagnostics.actualContent, template + '\n');
+    assert.equal(exported.journal.attempts.length, 0);
+  });
+  for (const mode of ['duplicate-detail', 'duplicate-rating']) {
+    test(`${mode}歧义弹框停止而不挑选第一个目标`, mode, async page => {
+      assert.equal((await run(page, { n: 1 })).code, 'DOM_NOT_UNIQUE');
+      assert.equal((await state(page)).submissions.length, 0);
+    });
+  }
+  test('等待弹框加载时急停即时结束；保留最后诊断且无提交', 'modal-delayed', async page => {
+    await page.evaluate(() => {
+      window.pending = window.PDDEvaluationHelper.startReportBatch({ n: 1 }).catch(e => ({ code: e.code }));
+    });
+    await page.waitForFunction(() => Boolean(document.querySelector('.comment-content .detail')));
+    await panel(page).locator('#report-stop').click();
+    assert.equal((await page.evaluate(() => window.pending)).code, 'CANCELLED');
+    const s = await state(page);
+    assert.equal(s.batch.error.details.stage, 'opened');
+    assert.equal(s.submissions.length, 0);
+    assert.equal(s.quota.used, 0);
   });
   test('无成功提示关闭弹框仍未知；不计成功且占额度；后续批阻止重发', 'unknown', async page => {
     const result = await run(page, { n: 1 });

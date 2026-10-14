@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-14.1
+// @name         PDD评价筛选助手 v2026-10-14.2
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-14.1
+// @version      2026-10-14.2
 // @description  PDD自动筛选回复与差评举报双模式，支持独立计数、每日举报限额、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-14.1',
+    version: '2026-10-14.2',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -774,6 +774,107 @@
     return Object.freeze({ submit });
   })();
 
+  const Rating = (() => {
+    const iconSelector = '[data-testid="beast-core-icon-star_filled"]';
+    // 图标形状并不代表分数；同一种实心SVG也可能被画成灰色，或在裁切层中隐藏。
+    function fraction(icon, root) {
+      const original = icon.getBoundingClientRect();
+      if (!DOM.visible(icon)) return 0;
+      let left = original.left, right = original.right, top = original.top, bottom = original.bottom;
+      for (let node = icon; node; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (Number(style.opacity) < 0.95) return 0;
+        if (node !== icon) {
+          const box = node.getBoundingClientRect();
+          if (/^(hidden|clip|auto|scroll)$/.test(style.overflowX)) {
+            left = Math.max(left, box.left); right = Math.min(right, box.right);
+          }
+          if (/^(hidden|clip|auto|scroll)$/.test(style.overflowY)) {
+            top = Math.max(top, box.top); bottom = Math.min(bottom, box.bottom);
+          }
+        }
+        if (node === root) break;
+      }
+      return Math.round(Math.max(0, right - left) * Math.max(0, bottom - top)
+        / (original.width * original.height) * 1000) / 1000;
+    }
+    function color(value) {
+      const match = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+))?\s*\)$/.exec(value);
+      if (!match || Number(match[4] ?? 1) < 0.95) return 'unknown';
+      const [r, g, b] = match.slice(1, 4).map(Number);
+      if (r >= 140 && r - g >= 45 && r - b >= 45) return 'active';
+      if (Math.min(r, g, b) >= 80 && Math.max(r, g, b) - Math.min(r, g, b) <= 15) return 'inactive';
+      return 'unknown';
+    }
+    function iconState(icon, root) {
+      const visibleFraction = fraction(icon, root);
+      const shapes = ReviewDOM.all('path, polygon, rect, circle, use', icon);
+      const paints = (shapes.length ? shapes : [icon]).map(shape => {
+        const style = getComputedStyle(shape);
+        return style.fill === 'none' ? style.stroke : style.fill;
+      });
+      const states = paints.map(color);
+      const state = visibleFraction === 0 ? 'hidden' : visibleFraction < 0.98 ? 'partial'
+        : states.every(value => value === 'active') ? 'active'
+        : states.every(value => value === 'inactive') ? 'inactive' : 'unknown';
+      return { state, visibleFraction, paints, color: getComputedStyle(icon).color };
+    }
+    function read(root) {
+      const rates = root.matches('[data-testid="beast-core-rate"]') ? [root]
+        : ReviewDOM.all('[data-testid="beast-core-rate"]', root).filter(DOM.visible);
+      const result = { value: null, source: null, issue: '', rateCount: rates.length,
+        svgCount: 0, visibleSvgCount: 0, declared: [], itemClasses: [], icons: [] };
+      if (rates.length > 1) return { ...result, svgCount: ReviewDOM.all(iconSelector, root).length,
+        issue: 'multiple_rating_controls' };
+      const area = rates[0] || root;
+      const icons = ReviewDOM.all(iconSelector, area);
+      const states = icons.map(icon => iconState(icon, area));
+      result.svgCount = icons.length;
+      result.visibleSvgCount = states.filter(icon => icon.visibleFraction > 0).length;
+      result.icons = states.slice(0, 12);
+      const items = ReviewDOM.all('li', area).filter(DOM.visible);
+      result.itemClasses = items.slice(0, 5).map(item => String(item.className).slice(0, 200));
+      const candidates = [];
+      if (rates.length) {
+        const values = [area, ...ReviewDOM.all('[role="slider"][aria-valuenow]', area).filter(DOM.visible)];
+        for (const element of values) {
+          for (const attribute of ['aria-valuenow', 'data-score', 'data-value']) {
+            if (!element.hasAttribute(attribute)) continue;
+            const raw = element.getAttribute(attribute);
+            result.declared.push({ attribute, raw });
+            if (!/^[1-5](?:\.0+)?$/.test(raw)) return { ...result, issue: 'invalid_declared_score' };
+            candidates.push({ source: attribute, value: Number(raw) });
+          }
+        }
+      }
+      if (items.some(item => /(?:^|\s)Rate_iconHalf_/.test(item.className))) {
+        return { ...result, issue: 'partial_star' };
+      }
+      const full = items.filter(item => /(?:^|\s)Rate_iconFull_/.test(item.className)).length;
+      if (full && items.length <= 5) candidates.push({ source: 'full_star_classes', value: full });
+      // 有双层图标时按每个li去重；完整红色层优先于下方灰色背景层。
+      const slots = items.length ? items.map(item => icons.map((icon, index) =>
+        item.contains(icon) ? states[index].state : null).filter(Boolean)) : states.map(icon => [icon.state]);
+      const painted = slots.filter(slot => slot.some(state => state !== 'hidden'))
+        .map(slot => slot.includes('partial') ? 'partial'
+        : slot.includes('active') ? 'active' : slot.includes('inactive') ? 'inactive' : 'unknown');
+      if (painted.includes('partial')) return { ...result, issue: 'partial_star' };
+      if (painted.length && painted.length <= 5 &&
+          painted.every(state => ['active', 'inactive'].includes(state))) {
+        candidates.push({ source: 'painted_stars', value: painted.filter(state => state === 'active').length });
+      }
+      if (!candidates.length) return { ...result, issue: 'score_unreadable' };
+      if (new Set(candidates.map(candidate => candidate.value)).size !== 1) {
+        return { ...result, issue: 'conflicting_score_evidence', candidates };
+      }
+      if (!Number.isInteger(candidates[0].value) || candidates[0].value < 1 || candidates[0].value > 5) {
+        return { ...result, issue: 'score_not_ready' };
+      }
+      return { ...result, ...candidates[0] };
+    }
+    return Object.freeze({ read });
+  })();
+
   const ReportDOM = (() => {
     const starLabels = ['1星', '2星', '3星', '4星', '5星'];
     async function toggle(label, selected, options) {
@@ -807,7 +908,7 @@
     }
     function stars(group) {
       const header = group.querySelector('.evaluation-item-header') || group;
-      return ReviewDOM.all('[data-testid="beast-core-icon-star_filled"]', header).filter(DOM.visible).length;
+      return Rating.read(header).value;
     }
     function current(rec, star) {
       const group = ReviewDOM.find(rec);
@@ -817,20 +918,62 @@
       }
       return group;
     }
-    function modal(rec, star) {
+    function inspectModal(rec, star, stage) {
       const modals = ReviewDOM.modals();
-      if (modals.length !== 1 ||
-          ReviewDOM.text(modals[0].querySelector(Config.selectors.modalTitle)) !== '举报该评价') {
-        throw new HelperError('UNEXPECTED_REPORT_MODAL', '未出现唯一“举报该评价”弹框，已停止。');
+      const element = modals.length === 1 ? modals[0] : null;
+      const title = element ? ReviewDOM.text(element.querySelector(Config.selectors.modalTitle)) : '';
+      const details = element ? ReviewDOM.all(Config.selectors.reportDetail, element).filter(DOM.visible) : [];
+      const rating = element ? Rating.read(element) : null;
+      const data = { stage, expectedContent: rec.content,
+        actualContent: details.length === 1 ? details[0].innerText : null,
+        expectedStar: star, actualStar: rating?.value ?? null, modalCount: modals.length,
+        modalTitle: title, detailCount: details.length, rating };
+      rec.reportDiagnostics = { ...data, observedAt: new Date().toISOString() };
+      return { element, data, matches: Boolean(element && title === '举报该评价' &&
+        details.length === 1 && data.actualContent === rec.content && rating.value === star) };
+    }
+    function modalError(data) {
+      let code, message;
+      if (data.modalCount !== 1 || data.modalTitle !== '举报该评价') {
+        code = 'UNEXPECTED_REPORT_MODAL'; message = '未出现唯一“举报该评价”弹框，已停止。';
+      } else if (data.detailCount > 1 || data.rating?.rateCount > 1) {
+        code = 'DOM_NOT_UNIQUE'; message = '举报弹框正文或评分控件不唯一。';
+      } else if (data.actualContent !== null && data.actualContent !== data.expectedContent) {
+        code = 'REPORT_MODAL_CONTENT_MISMATCH'; message = '举报弹框正文与列表原文不符；实际值已保存到台账。';
+      } else if (data.actualStar !== null && data.actualStar !== data.expectedStar) {
+        code = 'REPORT_MODAL_STAR_MISMATCH';
+        message = `举报弹框星级不符：预期${data.expectedStar}星，实际${data.actualStar}星。`;
+      } else if (data.actualContent === null) {
+        code = 'REPORT_MODAL_NOT_READY'; message = '举报弹框正文未加载完成；读取状态已保存到台账。';
+      } else {
+        code = 'REPORT_MODAL_STAR_UNREADABLE'; message = '无法确认举报弹框实际星级；图标和评分状态已保存到台账。';
       }
-      const element = modals[0];
-      const detail = ReviewDOM.one(Config.selectors.reportDetail, '举报弹框评价全文', element);
-      if (detail.innerText !== rec.content ||
-          ReviewDOM.all('[data-testid="beast-core-rate"] [data-testid="beast-core-icon-star_filled"]', element)
-            .filter(DOM.visible).length !== star) {
-        throw new HelperError('REPORT_RECORD_CHANGED', '举报弹框的正文或星级与当前记录不符。');
+      return Object.assign(new HelperError(code, message), { details: data });
+    }
+    function modal(rec, star, stage = 'form_check') {
+      const reading = inspectModal(rec, star, stage);
+      if (!reading.matches) throw modalError(reading.data);
+      return reading.element;
+    }
+    async function waitModal(rec, star, options, stage, ready = () => true) {
+      let signature;
+      try {
+        return await Wait.until(() => {
+          const reading = inspectModal(rec, star, stage);
+          if (reading.data.modalCount > 1 || reading.data.modalTitle &&
+              reading.data.modalTitle !== '举报该评价' || reading.data.detailCount > 1 ||
+              reading.data.rating?.rateCount > 1) throw modalError(reading.data);
+          const current = JSON.stringify(reading.data);
+          if (current !== signature) { signature = current; return false; }
+          return reading.matches && ready(reading.element) && reading.element;
+        }, { ...options, description: '等待举报弹框正文、星级和表单状态稳定' });
+      } catch (error) {
+        const data = rec.reportDiagnostics;
+        if (error.code === 'TIMEOUT' && data && (data.actualContent !== data.expectedContent ||
+            data.actualStar !== data.expectedStar)) throw modalError(data);
+        if (data && !error.details) error.details = data;
+        throw error;
       }
-      return element;
     }
     function reason(element) {
       const labels = ReviewDOM.all(Config.selectors.reportReason, element)
@@ -853,7 +996,7 @@
         !element.closest(Config.selectors.table) && !element.closest(Config.selectors.modal) &&
         !element.querySelector('input, textarea'));
     }
-    return Object.freeze({ toggle, selectStar, stars, current, modal, reason,
+    return Object.freeze({ toggle, selectStar, stars, current, modal, waitModal, reason,
       reasonSelected, reported, successMessages });
   })();
 
@@ -969,17 +1112,16 @@
       }
       link.scrollIntoView({ block: 'center', behavior: 'instant' });
       link.click();
-      await Wait.until(() => ReviewDOM.modals().length && ReportDOM.modal(rec, rec.star),
-        { ...options, description: '等待举报弹框' });
+      await ReportDOM.waitModal(rec, rec.star, options, 'opened');
+      ReportDOM.current(rec, rec.star);
       const choice = ReportDOM.reason(ReportDOM.modal(rec, rec.star));
       if (!DOM.enabled(choice) || !DOM.enabled(choice.querySelector('input'))) {
         throw new HelperError('REPORT_REASON_UNAVAILABLE', '同行恶意差评选项不可用。');
       }
       if (!ReportDOM.reasonSelected(ReportDOM.modal(rec, rec.star))) choice.click();
-      await Wait.until(() => {
-        const modal = ReportDOM.modal(rec, rec.star);
+      await ReportDOM.waitModal(rec, rec.star, options, 'reason_selected', modal => {
         return ReportDOM.reasonSelected(modal) && modal.querySelector(Config.selectors.reportInput);
-      }, { ...options, description: '等待举报说明输入框' });
+      });
       const input = ReviewDOM.one(Config.selectors.reportInput, '举报说明输入框', ReportDOM.modal(rec, rec.star));
       if (input.value) throw new HelperError('EXISTING_REPORT_TEXT', '举报框已有说明，未覆盖或提交。');
       if (Config.reportText.length < 20 || Config.reportText.length > 500 ||
@@ -987,13 +1129,12 @@
         throw new HelperError('REPORT_TOO_LONG', '统一举报文案不符合说明输入限制。');
       }
       ReviewDOM.setValue(input, Config.reportText);
-      await Wait.until(() => {
-        const modal = ReportDOM.modal(rec, rec.star);
+      await ReportDOM.waitModal(rec, rec.star, options, 'text_filled', modal => {
         const button = ReviewDOM.one(Config.selectors.reportButton, '提交举报按钮', modal);
         return ReviewDOM.one(Config.selectors.reportInput, '举报说明', modal).value === Config.reportText &&
           ReportDOM.reasonSelected(modal) && DOM.enabled(button) &&
           button.getAttribute('data-tracking-click-params') === 'reason_type=8';
-      }, { ...options, description: '核验举报类型、完整文案及提交按钮' });
+      });
       await Wait.until(() => !ReportDOM.successMessages().length,
         { ...options, description: '等待旧举报成功提示消失' });
       let armed = false;
@@ -1006,7 +1147,7 @@
       try {
         options.guard();
         ReportDOM.current(rec, rec.star);
-        const modal = ReportDOM.modal(rec, rec.star);
+        const modal = ReportDOM.modal(rec, rec.star, 'before_submit');
         const button = ReviewDOM.one(Config.selectors.reportButton, '提交举报按钮', modal);
         if (!ReportDOM.reasonSelected(modal) ||
             ReviewDOM.one(Config.selectors.reportInput, '举报说明', modal).value !== Config.reportText ||
@@ -1151,6 +1292,7 @@
       } catch (error) {
         batch.phase = 'stopped';
         batch.error = { code: error.code || error.name, message: error.message };
+        if (error.details) batch.error.details = error.details;
         ReportLedger.saveBatch(batch);
         throw error;
       }

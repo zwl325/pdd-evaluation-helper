@@ -47,7 +47,8 @@
     order: `880000-${String(i + 1).padStart(9, '0')}`, goodsId: i % 2 ? '8001' : '8002',
     time: `2026-10-14 10:00:${String(i).padStart(2, '0')}`, star, content, reported: false })),
     page: 1, pageSize: 2, filterStar: 1, filterGoods: '', queries: [], submissions: [], opens: [],
-    visits: [], goodsEvents: [], filterClicks: [], keepReported: mode === 'keep', delay: 25 };
+    visits: [], goodsEvents: [], filterClicks: [], earlyActions: [],
+    keepReported: mode === 'keep', delay: 25 };
   const s = window.sim;
   if (mode === 'large') s.records = Array.from({ length: 40 }, (_, i) => ({
     order: `880001-${String(i + 1).padStart(9, '0')}`, goodsId: '8001',
@@ -59,6 +60,30 @@
   const escapeText = text => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
   const stars = n => Array.from({ length: n }, () =>
     '<svg data-testid="beast-core-icon-star_filled" viewBox="0 0 12 12"><rect width="12" height="12"/></svg>').join('');
+  const paintedStars = n => Array.from({ length: 5 }, (_, i) => stars(1).replace('<svg ',
+    `<svg style="fill:${i < n ? '#dd4433' : '#cccccc'}" `)).join('');
+  function rating(n) {
+    if (mode === 'rating-aria' || mode === 'rating-data') {
+      return `<div data-testid="beast-core-rate" ${mode === 'rating-aria' ? 'aria-valuenow' : 'data-score'}="${n}">
+        ${paintedStars(5).replaceAll('#dd4433', '#3366cc')}</div>`;
+    }
+    if (mode === 'rating-classes') return `<ul data-testid="beast-core-rate">${Array.from({ length: 5 }, (_, i) =>
+      `<li class="Rate_icon_x ${i < n ? 'Rate_iconFull_x' : ''}">${stars(1).replace('<svg ', '<svg style="fill:black" ')}</li>`).join('')}</ul>`;
+    if (['rating-layers', 'rating-half'].includes(mode)) {
+      return `<ul data-testid="beast-core-rate">${Array.from({ length: 5 }, (_, i) =>
+        `<li class="Rate_icon_x ${i < n ? 'Rate_iconFull_x' : ''}" style="position:relative;width:12px;height:12px;overflow:hidden">
+          <div style="position:absolute;top:0;left:0">${stars(1).replace('<svg ', '<svg style="display:block;fill:#cccccc" ')}</div>
+          <div data-testid="beast-core-rate-iconFullColoring-${i}" style="position:absolute;top:0;left:0;overflow:hidden;width:${i < n ? mode === 'rating-half' && i === 0 ? 6 : 12 : 0}px">
+            ${stars(1).replace('<svg ', '<svg style="display:block;fill:#dd4433" ')}
+          </div></li>`).join('')}</ul>`;
+    }
+    let icons = mode === 'rating-unknown' ? paintedStars(5).replaceAll('#dd4433', '#3366cc')
+      : mode === 'rating-zero' ? paintedStars(0) : paintedStars(n);
+    if (mode === 'rating-hidden') icons += `<span hidden>${stars(5)}</span>`;
+    const attributes = mode === 'rating-conflict' ? 'aria-valuenow="5"'
+      : mode === 'rating-invalid' ? 'aria-valuenow="0"' : '';
+    return `<div data-testid="beast-core-rate" ${attributes}>${icons}</div>`;
+  }
   const available = () => s.records.filter(rec => (rec.star === s.filterStar ||
     mode === 'wrong-star' && s.filterStar === 1 && rec.order === '880000-000000002') &&
     (!rec.reported || s.keepReported) && (!s.filterGoods || rec.goodsId === s.filterGoods));
@@ -68,7 +93,7 @@
     s.page = Math.min(pages, s.page);
     const rows = records.slice((s.page - 1) * s.pageSize, s.page * s.pageSize).map(rec => `
       <div data-testid="beast-core-table-middle-tbody">
-        <div class="evaluation-item-header">评价分：${stars(rec.star)}</div>
+        <div class="evaluation-item-header">评价分：${mode === 'table-colored' ? paintedStars(rec.star) : stars(rec.star)}</div>
         <div data-testid="beast-core-table-body-tr">
           <div class="logic_reviewWrapper_x"><div>${escapeText(rec.content)}</div><span class="logic_replyTime_x">${rec.time}</span></div>
           <div>订单编号：${rec.order}</div><div class="goods-id">ID: ${rec.goodsId}</div>
@@ -119,7 +144,7 @@
     const modal = document.createElement('div');
     modal.dataset.testid = 'beast-core-modal-inner';
     modal.innerHTML = `<div class="MDL_header_x">${mode === 'wrong-modal' ? '评价详情' : '举报该评价'}</div>
-      <div data-testid="beast-core-rate">${stars(mode === 'modal-star' ? 5 : rec.star)}</div>
+      ${rating(mode === 'modal-star' ? 5 : rec.star)}
       <div class="comment-content"><span class="detail">${escapeText(mode === 'modal-content' ? '其他评价' : rec.content)}</span></div>
       <div id="reportType">${mode === 'missing-reason' ? '' :
         `<label data-testid="beast-core-radio" data-checked="false"><input type="radio" data-tracking-viewid="bad_peer_reviews">同行恶意差评</label>`}</div>
@@ -128,6 +153,21 @@
       <button data-tracking-viewid="new_confirm_report_btn" data-tracking-click-params="reason_type=undefined">提交举报</button>
       <button data-tracking-viewid="new_cancel_report_btn">取消</button>`;
     document.body.append(modal);
+    if (mode === 'duplicate-detail') modal.querySelector('.detail').after(modal.querySelector('.detail').cloneNode(true));
+    if (mode === 'duplicate-rating') modal.querySelector('[data-testid="beast-core-rate"]')
+      .after(modal.querySelector('[data-testid="beast-core-rate"]').cloneNode(true));
+    let loaded = !['modal-delayed', 'modal-unstable'].includes(mode);
+    const markLoading = () => {
+      modal.querySelector('.detail').textContent = '加载中';
+      modal.querySelector('[data-testid="beast-core-rate"]').innerHTML = '';
+    };
+    const finishLoading = () => {
+      modal.querySelector('.detail').textContent = rec.content;
+      modal.querySelector('[data-testid="beast-core-rate"]').outerHTML = rating(rec.star);
+      loaded = true;
+    };
+    if (mode === 'modal-delayed') { markLoading(); setTimeout(finishLoading, 450); }
+    if (mode === 'modal-unstable') { setTimeout(markLoading, 120); setTimeout(finishLoading, 500); }
     const label = modal.querySelector('label');
     if (mode === 'duplicate-reason') label.after(label.cloneNode(true));
     const input = modal.querySelector('textarea');
@@ -136,18 +176,29 @@
     if (mode === 'disabled-submit') submit.disabled = true;
     if (mode === 'short-max') input.maxLength = 20;
     let receivedInput = '', receivedChange = '';
-    label?.addEventListener('click', () => {
+    label?.addEventListener('click', event => {
+      // label.click()还会触发input的默认点击并冒泡；一次业务选择只启动一次模拟重绘。
+      if (event.target instanceof HTMLInputElement) return;
+      if (!loaded) s.earlyActions.push('reason');
       label.dataset.checked = 'true'; label.querySelector('input').checked = true;
       modal.querySelector('#describesNegativeReview').hidden = false;
       submit.setAttribute('data-tracking-click-params', mode === 'wrong-reason-id' ? 'reason_type=9' : 'reason_type=8');
+      if (mode === 'reason-delayed-rating') {
+        loaded = false;
+        modal.querySelector('[data-testid="beast-core-rate"]').innerHTML = '';
+        setTimeout(finishLoading, 450);
+      }
     });
     input.addEventListener('input', event => {
+      if (!loaded) s.earlyActions.push('input');
       receivedInput = event.target.value;
       if (mode === 'text-rejected') event.target.value = '拒绝填入';
       if (mode === 'cancel-before-submit') window.PDDEvaluationHelper.cancel();
+      if (mode === 'late-modal-content') modal.querySelector('.detail').textContent = '原文发生变化';
     });
     input.addEventListener('change', event => { receivedChange = event.target.value; });
     submit.addEventListener('click', () => {
+      if (!loaded) s.earlyActions.push('submit');
       s.submissions.push({ order, star: rec.star, value: input.value, receivedInput, receivedChange,
         reason: label.dataset.checked, reasonType: submit.getAttribute('data-tracking-click-params') });
       setTimeout(() => {
