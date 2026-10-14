@@ -529,7 +529,7 @@ async function main() {
     const result = await run(page, { n: 2 });
     assert.equal(result.ok, true);
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    await panel.locator('summary').click();
+    await panel.locator('#reply-details summary').click();
     assert.equal(await panel.locator('#reply-copy').isVisible(), true);
     assert.equal(await panel.locator('#reply-copy').innerText(), replyText);
     assert.equal(replyText.length, 145);

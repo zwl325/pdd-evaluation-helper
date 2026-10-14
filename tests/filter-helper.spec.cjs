@@ -141,7 +141,7 @@ async function main() {
       .shadowRoot.getElementById('run-once').nextElementSibling.id), 'stop');
     assert.equal(await panel.locator('#refresh').innerText(), '检查状态');
     assert.equal(await panel.locator('#export-batch').innerText(), '导出本机台账');
-    assert.equal(await panel.locator('summary').innerText(), '查看统一回复文案');
+    assert.equal(await panel.locator('#reply-details summary').innerText(), '查看统一回复文案');
     assert.equal(await panel.locator('.badge, [data-select], #all').count(), 0);
     assert.equal(await panel.locator('#collapse').innerText(), '收起');
     const before = await panel.locator('#status').innerText();
@@ -173,7 +173,7 @@ async function main() {
   test('最小化后恢复面板，参数与文案展开状态保留', 'normal', async page => {
     const panel = page.locator('#pdd-evaluation-helper-panel');
     await panel.locator('#batch-n').fill('5');
-    await panel.locator('summary').click();
+    await panel.locator('#reply-details summary').click();
     await panel.locator('#minimize').click();
     assert.equal(await panel.locator('#body').isVisible(), false);
     assert.equal(await panel.locator('#drag-handle').isVisible(), false);

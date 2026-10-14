@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>举报模式离线夹具 · 全部为合成数据</title>
+<style>
+  body { font: 15px/1.65 system-ui, "Microsoft YaHei"; margin: 24px; background: #f5f6fa; }
+  #mf-mms-goods-container { background: white; padding: 16px; max-width: 680px; }
+  .evaluation_search_btn { display: inline-block; padding: 4px 10px; margin: 3px; border: 1px solid #ddd; cursor: pointer; }
+  .evaluation_search_btn_checked { color: #e02e24; border-color: #e02e24; }
+  [data-testid="beast-core-table-middle-tbody"] { border-bottom: 1px solid #ddd; padding: 8px; }
+  .logic_reviewWrapper_x > div, .comment-content .detail { white-space: pre-wrap; }
+  svg { width: 12px; height: 12px; fill: #e02e24; }
+  li { display: inline-block; margin: 4px; padding: 4px; cursor: pointer; }
+  .PGT_disabled { color: #aaa; }
+  [data-testid="beast-core-modal-inner"] { position: fixed; left: 50px; top: 60px; width: 620px;
+    background: white; padding: 18px; border: 1px solid #999; z-index: 10; }
+  [data-testid="beast-core-radio"] { display: inline-block; margin: 6px; border: 1px solid #ccc; padding: 6px; }
+  [data-checked="true"] { color: #e02e24; }
+  textarea { width: 100%; height: 140px; }
+  #toast:not(:empty) { background: #e7f8ed; padding: 8px; display: inline-block; }
+</style>
+<div>任意合成测试店铺<br>任意合成测试店铺：测试账号<br>退出当前账号</div><div>后台首页</div>
+<div id="mf-mms-goods-container">
+  <h2>商品评价 · 举报模式合成测试数据</h2>
+  <div id="evaluationSearchId"><form>
+    <div id="goodsId"><label>商品ID <input value="9999"></label></div>
+    <label>订单号 <input id="order-input"></label>
+    <div id="filters">
+      <div class="evaluation_search_btn">1星</div><div class="evaluation_search_btn">2星</div>
+      <div class="evaluation_search_btn">3星</div><div class="evaluation_search_btn evaluation_search_btn_checked">4星</div>
+      <div class="evaluation_search_btn evaluation_search_btn_checked">5星</div>
+      <div class="evaluation_search_btn evaluation_search_btn_checked">未回复</div>
+      <div class="evaluation_search_btn">已回复</div>
+      <div class="evaluation_search_btn evaluation_search_btn_checked">近90天</div>
+    </div>
+    <button id="query" type="button">查询</button>
+  </form></div>
+  <div id="results"></div>
+</div><span id="toast"></span>
+<script>
+  'use strict';
+  const mode = new URLSearchParams(location.search).get('mode') || 'normal';
+  const template = '该用户未填写文字评价';
+  const entries = [[1, '商品质量有问题'], [1, template], [1, template + ' '],
+    [2, template], [2, template], [2, '一般'], [3, template], [3, template]];
+  window.sim = { records: entries.map(([star, content], i) => ({
+    order: `880000-${String(i + 1).padStart(9, '0')}`, goodsId: i % 2 ? '8001' : '8002',
+    time: `2026-10-14 10:00:${String(i).padStart(2, '0')}`, star, content, reported: false })),
+    page: 1, pageSize: 2, filterStar: 1, filterGoods: '', queries: [], submissions: [], opens: [],
+    visits: [], goodsEvents: [], filterClicks: [], keepReported: mode === 'keep', delay: 25 };
+  const s = window.sim;
+  if (mode === 'large') s.records = Array.from({ length: 40 }, (_, i) => ({
+    order: `880001-${String(i + 1).padStart(9, '0')}`, goodsId: '8001',
+    time: `2026-10-14 11:00:${String(i).padStart(2, '0')}`, star: 1, content: template, reported: false }));
+  if (mode === 'empty') s.records = [];
+  if (mode === 'residual') document.querySelector('#order-input').value = '旧条件';
+  if (mode === 'wrong-star') s.records[1].star = 5;
+  if (mode === 'slow-query') s.delay = 500;
+  const escapeText = text => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
+  const stars = n => Array.from({ length: n }, () =>
+    '<svg data-testid="beast-core-icon-star_filled" viewBox="0 0 12 12"><rect width="12" height="12"/></svg>').join('');
+  const available = () => s.records.filter(rec => (rec.star === s.filterStar ||
+    mode === 'wrong-star' && s.filterStar === 1 && rec.order === '880000-000000002') &&
+    (!rec.reported || s.keepReported) && (!s.filterGoods || rec.goodsId === s.filterGoods));
+  window.renderFixture = function render() {
+    const records = available();
+    const pages = Math.max(1, Math.ceil(records.length / s.pageSize));
+    s.page = Math.min(pages, s.page);
+    const rows = records.slice((s.page - 1) * s.pageSize, s.page * s.pageSize).map(rec => `
+      <div data-testid="beast-core-table-middle-tbody">
+        <div class="evaluation-item-header">评价分：${stars(rec.star)}</div>
+        <div data-testid="beast-core-table-body-tr">
+          <div class="logic_reviewWrapper_x"><div>${escapeText(rec.content)}</div><span class="logic_replyTime_x">${rec.time}</span></div>
+          <div>订单编号：${rec.order}</div><div class="goods-id">ID: ${rec.goodsId}</div>
+          <div data-tracking-click-viewid="report">${rec.reported ? '<span>已举报</span>' :
+            `<a href="#" data-order="${rec.order}">举报</a>`}</div>
+          <a href="#">回复/互动</a>
+        </div>
+      </div>`).join('') || '<div>暂无数据</div>';
+    document.querySelector('#results').innerHTML = `<div data-testid="beast-core-table">${rows}</div>
+      <ul data-testid="beast-core-pagination"><li class="PGT_totalText">共有 ${records.length} 条</li>
+      <li data-testid="beast-core-pagination-prev" class="${s.page === 1 ? 'PGT_disabled' : ''}">上一页</li>
+      ${Array.from({ length: pages }, (_, i) => `<li class="${i + 1 === s.page ? 'PGT_pagerItemActive' : ''}">${i + 1}</li>`).join('')}
+      <li data-testid="beast-core-pagination-next" class="${s.page === pages ? 'PGT_disabled' : ''}">下一页</li></ul>`;
+    s.visits.push({ star: s.filterStar, page: s.page, submitted: s.submissions.length });
+  };
+  function load(action) {
+    const table = document.querySelector('[data-testid="beast-core-table"]');
+    table.setAttribute('aria-busy', 'true');
+    if (mode === 'unmount') table.remove();
+    setTimeout(() => { action(); window.renderFixture(); }, s.delay);
+  }
+  window.renderFixture();
+  document.querySelector('#goodsId input').addEventListener('input', event => {
+    s.goodsEvents.push(event.target.value);
+    if (mode === 'goods-rejected') event.target.value = '9999';
+  });
+  document.querySelectorAll('.evaluation_search_btn').forEach(el => el.addEventListener('click', () => {
+    s.filterClicks.push(el.innerText);
+    el.classList.toggle('evaluation_search_btn_checked');
+  }));
+  document.querySelector('#query').addEventListener('click', () => {
+    const selected = [...document.querySelectorAll('.evaluation_search_btn_checked')].map(el => el.innerText);
+    const star = Number(selected.find(label => /^[1-5]星$/.test(label))?.[0]);
+    s.queries.push({ star, selected, submitted: s.submissions.length });
+    if (mode === 'query-noop') return;
+    load(() => { s.page = 1; s.filterStar = star; s.filterGoods = document.querySelector('#goodsId input').value; });
+  });
+  function openReport(order) {
+    const rec = s.records.find(rec => rec.order === order);
+    s.opens.push(order);
+    if (mode === 'content-change') { rec.content += '补充'; window.renderFixture(); }
+    if (mode === 'identity-change') { rec.time = '2026-10-14 23:59:59'; window.renderFixture(); }
+    if (mode === 'filter-change') document.querySelector('#order-input').value = '变化';
+    if (mode === 'stale-toast') {
+      document.querySelector('#toast').textContent = '举报成功';
+      setTimeout(() => { document.querySelector('#toast').textContent = ''; }, 450);
+    }
+    const modal = document.createElement('div');
+    modal.dataset.testid = 'beast-core-modal-inner';
+    modal.innerHTML = `<div class="MDL_header_x">${mode === 'wrong-modal' ? '评价详情' : '举报该评价'}</div>
+      <div data-testid="beast-core-rate">${stars(mode === 'modal-star' ? 5 : rec.star)}</div>
+      <div class="comment-content"><span class="detail">${escapeText(mode === 'modal-content' ? '其他评价' : rec.content)}</span></div>
+      <div id="reportType">${mode === 'missing-reason' ? '' :
+        `<label data-testid="beast-core-radio" data-checked="false"><input type="radio" data-tracking-viewid="bad_peer_reviews">同行恶意差评</label>`}</div>
+      <div id="describesNegativeReview" hidden><textarea data-testid="beast-core-textArea-htmlInput"
+        maxlength="500" placeholder="至少20字，请说明举报原因"></textarea></div>
+      <button data-tracking-viewid="new_confirm_report_btn" data-tracking-click-params="reason_type=undefined">提交举报</button>
+      <button data-tracking-viewid="new_cancel_report_btn">取消</button>`;
+    document.body.append(modal);
+    const label = modal.querySelector('label');
+    if (mode === 'duplicate-reason') label.after(label.cloneNode(true));
+    const input = modal.querySelector('textarea');
+    if (mode === 'existing-text') input.value = '现有说明';
+    const submit = modal.querySelector('[data-tracking-viewid="new_confirm_report_btn"]');
+    if (mode === 'disabled-submit') submit.disabled = true;
+    if (mode === 'short-max') input.maxLength = 20;
+    let receivedInput = '', receivedChange = '';
+    label?.addEventListener('click', () => {
+      label.dataset.checked = 'true'; label.querySelector('input').checked = true;
+      modal.querySelector('#describesNegativeReview').hidden = false;
+      submit.setAttribute('data-tracking-click-params', mode === 'wrong-reason-id' ? 'reason_type=9' : 'reason_type=8');
+    });
+    input.addEventListener('input', event => {
+      receivedInput = event.target.value;
+      if (mode === 'text-rejected') event.target.value = '拒绝填入';
+      if (mode === 'cancel-before-submit') window.PDDEvaluationHelper.cancel();
+    });
+    input.addEventListener('change', event => { receivedChange = event.target.value; });
+    submit.addEventListener('click', () => {
+      s.submissions.push({ order, star: rec.star, value: input.value, receivedInput, receivedChange,
+        reason: label.dataset.checked, reasonType: submit.getAttribute('data-tracking-click-params') });
+      setTimeout(() => {
+        modal.remove();
+        if (['unknown', 'stale-toast', 'cancel-after-submit'].includes(mode)) return;
+        rec.reported = true;
+        window.renderFixture();
+        document.querySelector('#toast').textContent = '举报成功！';
+        setTimeout(() => { document.querySelector('#toast').textContent = ''; }, 80);
+      }, 25);
+    });
+    modal.querySelector('[data-tracking-viewid="new_cancel_report_btn"]').addEventListener('click', () => modal.remove());
+  }
+  document.querySelector('#results').addEventListener('click', event => {
+    const order = event.target.getAttribute('data-order');
+    if (order) { event.preventDefault(); openReport(order); return; }
+    const direction = event.target.getAttribute('data-testid');
+    if (direction === 'beast-core-pagination-next') load(() => { s.page++; });
+    if (direction === 'beast-core-pagination-prev') load(() => { s.page--; });
+  });
+</script>
+</html>

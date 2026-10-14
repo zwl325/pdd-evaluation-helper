@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-13.4
+// @name         PDD评价筛选助手 v2026-10-14.1
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-13.4
-// @description  PDD评价筛选与逐条即时回复，支持检查计数、可拖拽折叠面板及精确匹配的默认好评正文。
+// @version      2026-10-14.1
+// @description  PDD自动筛选回复与差评举报双模式，支持独立计数、每日举报限额、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
 // @supportURL   https://github.com/zwl325/pdd-evaluation-helper/issues
@@ -19,9 +19,9 @@
   'use strict';
 
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
-  // 定位依据：Tampermonkey-点击动作DOM定位清单.md（2026-10-12，非实时DOM）。
+  // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-13.4',
+    version: '2026-10-14.1',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -44,7 +44,14 @@
     journalKey: 'pdd-evaluation-helper:submissions:v1',
     batchKey: 'pdd-evaluation-helper:last-batch:v1',
     panelKey: 'pdd-evaluation-helper:panel:v1',
+    reportJournalKey: 'pdd-evaluation-helper:reports:v1',
+    reportBatchKey: 'pdd-evaluation-helper:last-report-batch:v1',
     lockName: 'pdd-evaluation-helper:batch:v1',
+    reportStars: Object.freeze(['1星', '2星', '3星']),
+    reportDailyLimit: 30,
+    reportContent: '该用户未填写文字评价',
+    reportReason: '同行恶意差评',
+    reportText: '平台审核组：\n近期店铺出现多个异常评价，经数据核查，存在以下可疑特征：\n\n1. 账号共性：头像简单或使用随机数字 ID。\n2. 行为异常：均直接购买，平均停留不足5分钟。\n3. 评价异常：差评均反映商品质量差。\n4. 物流正常：每24小时有物流更新，仍投诉物流慢。\n5. 关联特征：每逢大促集中出现中差评，请明察，还店铺清白。\n6. 我愿意退换货，但该同行拒绝，并以差评要挟，谋取不正当利益，影响公平竞争，请严查！',
     replyPattern: /^该用户觉得商品很好(?:，给出了[45]星好评)?$/,
     replyText: '小店每天最开心的事莫过于看到亲的好评，亲的好评就像是清泉一样滋润我们的心田，小店会更加的珍惜亲的好评，不断的改进自己，完善自己，力求让小店的服务做得更好，店铺做得更大，也是为了让亲能够更好的买到自己的喜欢的宝贝。你的好评就是对我们最大的肯定和鼓励，希望亲再次关顾我们的店铺，检验小店的进步。',
     selectors: Object.freeze({
@@ -62,6 +69,11 @@
       modalTitle: '[class*="MDL_header"]',
       replyInput: 'textarea[data-testid="beast-core-textArea-htmlInput"]',
       replyButton: 'button[data-tracking-click-viewid="reply_btn"]',
+      reportLink: '[data-tracking-click-viewid="report"] a',
+      reportReason: '#reportType label[data-testid="beast-core-radio"]',
+      reportInput: '#describesNegativeReview textarea[data-testid="beast-core-textArea-htmlInput"]',
+      reportButton: 'button[data-tracking-viewid="new_confirm_report_btn"]',
+      reportDetail: '.comment-content .detail',
       loading: '[aria-busy="true"], [data-testid="beast-core-loading"], [class*="LOA_loading"]',
     }),
   });
@@ -230,7 +242,7 @@
 
   const Actions = (() => {
     let active = null;
-    let status = { busy: false, tone: 'info', message: '设置参数后点击“一键运行”。' };
+    let status = { busy: false, taskMode: 'reply', tone: 'info', message: '设置参数后点击“一键运行”。' };
     const listeners = new Set();
 
     function notify(next) {
@@ -260,7 +272,8 @@
         },
       };
       active = job;
-      notify({ busy: true, tone: 'info', message: '正在确认评价页及三个筛选目标…' });
+      notify({ busy: true, ...(!borrowedJob ? { taskMode: 'reply' } : {}),
+        tone: 'info', message: '正在确认评价页及三个筛选目标…' });
       const results = [];
 
       try {
@@ -328,18 +341,18 @@
       }
     }
 
-    async function runTask(execute) {
+    async function runTask(execute, taskMode = 'reply') {
       if (active) throw new HelperError('BUSY', '已有操作正在执行。');
       const job = { controller: new AbortController(), url: location.href };
       job.options = {
         signal: job.controller.signal,
         guard: () => {
-          if (job.controller.signal.aborted) throw new HelperError('CANCELLED', '批次已停止，已提交的回复无法撤销。');
+          if (job.controller.signal.aborted) throw new HelperError('CANCELLED', '批次已停止，已提交的操作无法撤销。');
           if (location.href !== job.url) throw new HelperError('PAGE_CHANGED', '页面地址已改变，批次停止。');
         },
       };
       active = job;
-      notify({ busy: true, tone: 'info', message: '正在启动批次…' });
+      notify({ busy: true, taskMode, tone: 'info', message: '正在启动批次…' });
       try {
         return await execute(job);
       } catch (error) {
@@ -511,7 +524,7 @@
         const value = store.getItem(key);
         return value ? JSON.parse(value) : fallback;
       } catch {
-        throw new HelperError('STORAGE_UNAVAILABLE', '本机台账无法读取；回复操作停止。');
+        throw new HelperError('STORAGE_UNAVAILABLE', '本机台账无法读取；操作停止。');
       }
     }
     function write(store, key, value) {
@@ -520,7 +533,7 @@
         store.setItem(key, text);
         if (store.getItem(key) !== text) throw new Error('Persistence mismatch');
       } catch {
-        throw new HelperError('STORAGE_UNAVAILABLE', '本机台账无法保存；回复操作停止。');
+        throw new HelperError('STORAGE_UNAVAILABLE', '本机台账无法保存；操作停止。');
       }
     }
     function remove(store, key) {
@@ -761,6 +774,390 @@
     return Object.freeze({ submit });
   })();
 
+  const ReportDOM = (() => {
+    const starLabels = ['1星', '2星', '3星', '4星', '5星'];
+    async function toggle(label, selected, options) {
+      options.guard();
+      const element = DOM.resolve(label);
+      if (!element) throw new HelperError('MISSING_FILTER', `找不到“${label}”筛选。`);
+      if (DOM.selected(element) !== selected) {
+        if (!DOM.enabled(element)) throw new HelperError('DISABLED_TARGET', `“${label}”不可点击。`);
+        element.click();
+      }
+      await Wait.until(() => {
+        const current = DOM.resolve(label);
+        return current && DOM.selected(current) === selected;
+      }, { ...options, description: `核验“${label}”${selected ? '选中' : '取消'}` });
+    }
+    async function selectStar(label, options) {
+      for (const other of starLabels.filter(value => value !== label)) {
+        const element = DOM.resolve(other);
+        if (element && DOM.selected(element)) await toggle(other, false, options);
+      }
+      // 举报不限回复状态；清除自动回复模式遗留的限制。
+      for (const replyState of ['未回复', '已回复']) {
+        const element = DOM.resolve(replyState);
+        if (element && DOM.selected(element)) await toggle(replyState, false, options);
+      }
+      await toggle(label, true, options);
+      if (starLabels.some(other => other !== label && DOM.resolve(other) && DOM.selected(DOM.resolve(other))) ||
+          ['未回复', '已回复'].some(other => DOM.resolve(other) && DOM.selected(DOM.resolve(other)))) {
+        throw new HelperError('CONFLICTING_FILTERS', '举报星级或回复状态筛选有冲突，已停止。');
+      }
+    }
+    function stars(group) {
+      const header = group.querySelector('.evaluation-item-header') || group;
+      return ReviewDOM.all('[data-testid="beast-core-icon-star_filled"]', header).filter(DOM.visible).length;
+    }
+    function current(rec, star) {
+      const group = ReviewDOM.find(rec);
+      if (!group || ReviewDOM.record(group, rec.shop).content !== Config.reportContent ||
+          rec.content !== Config.reportContent || stars(group) !== star) {
+        throw new HelperError('REPORT_RECORD_CHANGED', '举报前评价身份、正文或星级变化，已停止。');
+      }
+      return group;
+    }
+    function modal(rec, star) {
+      const modals = ReviewDOM.modals();
+      if (modals.length !== 1 ||
+          ReviewDOM.text(modals[0].querySelector(Config.selectors.modalTitle)) !== '举报该评价') {
+        throw new HelperError('UNEXPECTED_REPORT_MODAL', '未出现唯一“举报该评价”弹框，已停止。');
+      }
+      const element = modals[0];
+      const detail = ReviewDOM.one(Config.selectors.reportDetail, '举报弹框评价全文', element);
+      if (detail.innerText !== rec.content ||
+          ReviewDOM.all('[data-testid="beast-core-rate"] [data-testid="beast-core-icon-star_filled"]', element)
+            .filter(DOM.visible).length !== star) {
+        throw new HelperError('REPORT_RECORD_CHANGED', '举报弹框的正文或星级与当前记录不符。');
+      }
+      return element;
+    }
+    function reason(element) {
+      const labels = ReviewDOM.all(Config.selectors.reportReason, element)
+        .filter(label => DOM.visible(label) && ReviewDOM.text(label) === Config.reportReason &&
+          label.querySelector('input[data-tracking-viewid="bad_peer_reviews"]'));
+      if (labels.length !== 1) throw new HelperError('REPORT_REASON_UNAVAILABLE', '同行恶意差评选项不可唯一定位。');
+      return labels[0];
+    }
+    function reasonSelected(element) {
+      const label = reason(element);
+      return label.dataset.checked === 'true' && label.querySelector('input').checked;
+    }
+    function reported(group) {
+      const region = group.querySelector('[data-tracking-click-viewid="report"]');
+      return Boolean(region && /^(?:已举报|举报处理中|举报成功)$/.test(ReviewDOM.text(region)));
+    }
+    function successMessages() {
+      return ReviewDOM.all('div, span, p, [role="status"], [role="alert"]').filter(element =>
+        DOM.visible(element) && /^举报成功[！!。]?$/.test(ReviewDOM.text(element)) &&
+        !element.closest(Config.selectors.table) && !element.closest(Config.selectors.modal) &&
+        !element.querySelector('input, textarea'));
+    }
+    return Object.freeze({ toggle, selectStar, stars, current, modal, reason,
+      reasonSelected, reported, successMessages });
+  })();
+
+  const ReportLedger = (() => {
+    const statuses = ['submitting', 'submitted_unverified', 'confirmed', 'not_submitted_user_verified'];
+    const day = () => {
+      const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai',
+        year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+      const get = type => parts.find(part => part.type === type).value;
+      return `${get('year')}-${get('month')}-${get('day')}`;
+    };
+    function journal() {
+      const data = Ledger.read(localStorage, Config.reportJournalKey, { schema: 1, attempts: [] });
+      if (data?.schema !== 1 || !Array.isArray(data.attempts) ||
+          data.attempts.some(entry => !entry || !statuses.includes(entry.status) ||
+            typeof entry.id !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.day) ||
+            ![entry.order, entry.goodsId, entry.time].every(value => typeof value === 'string' && value.length) ||
+            entry.key !== ReviewDOM.recordKey(entry)) ||
+          new Set(data.attempts.map(entry => entry.id)).size !== data.attempts.length) {
+        throw new HelperError('INVALID_REPORT_JOURNAL', '举报台账格式异常，未开始提交。');
+      }
+      return data;
+    }
+    function quota(date = day(), data = journal()) {
+      const entries = data.attempts.filter(entry => entry.day === date);
+      const confirmed = entries.filter(entry => entry.status === 'confirmed').length;
+      const uncertain = entries.filter(entry => ['submitting', 'submitted_unverified'].includes(entry.status)).length;
+      return { day: date, confirmed, uncertain, used: confirmed + uncertain,
+        remaining: Math.max(0, Config.reportDailyLimit - confirmed - uncertain), limit: Config.reportDailyLimit };
+    }
+    function previous(rec) {
+      const entries = journal().attempts.filter(entry => entry.key === rec.key);
+      return entries.find(entry => ['submitting', 'submitted_unverified'].includes(entry.status)) ||
+        entries.find(entry => entry.status === 'confirmed') || null;
+    }
+    function reserve(rec, batch) {
+      const data = journal();
+      if (day() !== batch.day) throw new HelperError('REPORT_DAY_CHANGED', '已跨北京时间日期，请重新启动举报任务。');
+      if (!quota(batch.day, data).remaining) throw new HelperError('REPORT_DAILY_LIMIT', '今日举报额度已用完。');
+      if (data.attempts.some(entry => entry.key === rec.key && entry.status !== 'not_submitted_user_verified')) {
+        throw new HelperError('REPORT_ALREADY_SUBMITTED', '当前身份已有举报提交，未重复发送。');
+      }
+      const entry = { id: crypto.randomUUID(), key: rec.key, shop: rec.shop, order: rec.order,
+        goodsId: rec.goodsId, time: rec.time, star: rec.star, day: batch.day, status: 'submitting',
+        reportText: Config.reportText, reason: Config.reportReason, at: new Date().toISOString(), history: [] };
+      data.attempts.push(entry);
+      Ledger.write(localStorage, Config.reportJournalKey, data);
+      rec.attemptId = entry.id;
+      rec.status = 'submitting';
+      return entry.id;
+    }
+    function update(rec, status, evidence = '') {
+      const data = journal();
+      const entry = data.attempts.find(value => value.id === rec.attemptId);
+      if (!entry || !['submitting', 'submitted_unverified'].includes(entry.status)) {
+        throw new HelperError('REPORT_JOURNAL_CHANGED', '举报提交台账变化，需人工核验。');
+      }
+      entry.history.push({ status: entry.status, at: entry.at, evidence: entry.evidence });
+      Object.assign(entry, { status, evidence, at: new Date().toISOString() });
+      Ledger.write(localStorage, Config.reportJournalKey, data);
+      rec.status = status;
+      rec.evidence = evidence;
+    }
+    function saveBatch(batch) {
+      batch.summary = { checked: batch.records.length,
+        reported: batch.records.filter(rec => rec.status === 'confirmed').length,
+        skipped: batch.records.filter(rec => rec.status?.startsWith('skipped_')).length };
+      Ledger.write(sessionStorage, Config.reportBatchKey, batch);
+    }
+    const lastBatch = () => Ledger.read(sessionStorage, Config.reportBatchKey, null);
+    function exportData() {
+      const blob = new Blob([JSON.stringify({ mode: 'report', quota: quota(), batch: lastBatch(),
+        journal: journal() }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `pdd-evaluation-reports-${Date.now()}.json`;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+    async function resolve(id, verdict, note) {
+      if (Actions.status().busy) throw new HelperError('BUSY', '任务期间不能修改举报台账。');
+      if (!['confirmed', 'not_submitted_user_verified'].includes(verdict) || !String(note || '').trim()) {
+        throw new HelperError('INVALID_RESOLUTION', '人工核验必须明确结论并填写依据。');
+      }
+      if (!navigator.locks?.request) throw new HelperError('LOCK_UNAVAILABLE', '浏览器不支持运行锁。');
+      return navigator.locks.request(Config.lockName, { ifAvailable: true }, lock => {
+        if (!lock) throw new HelperError('OTHER_TAB_BUSY', '其他标签页正在运行，无法人工核验。');
+        const data = journal();
+        const entry = data.attempts.find(value => value.id === id);
+        if (!entry || !['submitting', 'submitted_unverified'].includes(entry.status)) {
+          throw new HelperError('NO_UNCERTAIN_ENTRY', '没有该提交对应的未知举报。');
+        }
+        entry.history.push({ status: entry.status, at: entry.at, evidence: entry.evidence });
+        entry.status = verdict;
+        entry.at = new Date().toISOString();
+        entry.manualVerification = { note: String(note), at: entry.at };
+        Ledger.write(localStorage, Config.reportJournalKey, data);
+        return { ...entry };
+      });
+    }
+    return Object.freeze({ day, journal, quota, previous, reserve, update, saveBatch, lastBatch, exportData, resolve });
+  })();
+
+  const Reports = (() => {
+    async function submit(rec, batch, options) {
+      options.guard();
+      const group = ReportDOM.current(rec, rec.star);
+      if (ReviewDOM.modals().length) throw new HelperError('EXISTING_MODAL', '页面已有弹框，举报停止。');
+      const link = ReviewDOM.one(Config.selectors.reportLink, '当前评价举报入口', group);
+      if (!DOM.enabled(link) || ReviewDOM.text(link) !== '举报') {
+        throw new HelperError('REPORT_LINK_UNAVAILABLE', '当前评价举报入口不可点击。');
+      }
+      link.scrollIntoView({ block: 'center', behavior: 'instant' });
+      link.click();
+      await Wait.until(() => ReviewDOM.modals().length && ReportDOM.modal(rec, rec.star),
+        { ...options, description: '等待举报弹框' });
+      const choice = ReportDOM.reason(ReportDOM.modal(rec, rec.star));
+      if (!DOM.enabled(choice) || !DOM.enabled(choice.querySelector('input'))) {
+        throw new HelperError('REPORT_REASON_UNAVAILABLE', '同行恶意差评选项不可用。');
+      }
+      if (!ReportDOM.reasonSelected(ReportDOM.modal(rec, rec.star))) choice.click();
+      await Wait.until(() => {
+        const modal = ReportDOM.modal(rec, rec.star);
+        return ReportDOM.reasonSelected(modal) && modal.querySelector(Config.selectors.reportInput);
+      }, { ...options, description: '等待举报说明输入框' });
+      const input = ReviewDOM.one(Config.selectors.reportInput, '举报说明输入框', ReportDOM.modal(rec, rec.star));
+      if (input.value) throw new HelperError('EXISTING_REPORT_TEXT', '举报框已有说明，未覆盖或提交。');
+      if (Config.reportText.length < 20 || Config.reportText.length > 500 ||
+          input.maxLength > 0 && input.maxLength < Config.reportText.length) {
+        throw new HelperError('REPORT_TOO_LONG', '统一举报文案不符合说明输入限制。');
+      }
+      ReviewDOM.setValue(input, Config.reportText);
+      await Wait.until(() => {
+        const modal = ReportDOM.modal(rec, rec.star);
+        const button = ReviewDOM.one(Config.selectors.reportButton, '提交举报按钮', modal);
+        return ReviewDOM.one(Config.selectors.reportInput, '举报说明', modal).value === Config.reportText &&
+          ReportDOM.reasonSelected(modal) && DOM.enabled(button) &&
+          button.getAttribute('data-tracking-click-params') === 'reason_type=8';
+      }, { ...options, description: '核验举报类型、完整文案及提交按钮' });
+      await Wait.until(() => !ReportDOM.successMessages().length,
+        { ...options, description: '等待旧举报成功提示消失' });
+      let armed = false;
+      let freshSuccess = false;
+      const observer = new MutationObserver(() => {
+        if (armed && ReportDOM.successMessages().length) freshSuccess = true;
+      });
+      observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+      let submitted = false;
+      try {
+        options.guard();
+        ReportDOM.current(rec, rec.star);
+        const modal = ReportDOM.modal(rec, rec.star);
+        const button = ReviewDOM.one(Config.selectors.reportButton, '提交举报按钮', modal);
+        if (!ReportDOM.reasonSelected(modal) ||
+            ReviewDOM.one(Config.selectors.reportInput, '举报说明', modal).value !== Config.reportText ||
+            !DOM.enabled(button) || button.getAttribute('data-tracking-click-params') !== 'reason_type=8') {
+          throw new HelperError('REPORT_NOT_READY', '举报提交前表单状态改变。');
+        }
+        ReportLedger.reserve(rec, batch);
+        ReportLedger.saveBatch(batch);
+        submitted = true;
+        armed = true;
+        button.click();
+        await Wait.until(() => {
+          if (ReportDOM.successMessages().length) freshSuccess = true;
+          return freshSuccess && !ReviewDOM.modals().length;
+        }, { ...options, timeoutMs: Config.submissionTimeoutMs, stableMs: 0,
+          description: '等待本次举报成功提示及弹框关闭' });
+        ReportLedger.update(rec, 'confirmed', 'fresh_report_success');
+        ReportLedger.saveBatch(batch);
+        Actions.update({ message: `本次成功举报${batch.summary.reported}/${batch.target}条；已检查${batch.summary.checked}条。` });
+        await Results.stable(options);
+      } catch (error) {
+        if (submitted && rec.status !== 'confirmed') {
+          ReportLedger.update(rec, 'submitted_unverified', error.code || error.message);
+          ReportLedger.saveBatch(batch);
+          throw new HelperError('REPORT_SUBMITTED_UNVERIFIED', '已发出一次举报但结果不明；未计成功，保留额度并停止，请核验台账。');
+        }
+        throw error;
+      } finally { observer.disconnect(); }
+    }
+    return Object.freeze({ submit });
+  })();
+
+  const ReportWorkflow = (() => {
+    async function execute(p, job) {
+      const options = job.options;
+      const batch = { id: crypto.randomUUID(), version: Config.version, taskMode: 'report',
+        startedAt: new Date().toISOString(), day: ReportLedger.day(), shop: '',
+        params: p, target: 0, star: 1, phase: 'querying', records: [] };
+      ReportLedger.saveBatch(batch);
+      const originalGuard = options.guard;
+      let filterSignature;
+      options.guard = () => {
+        originalGuard();
+        if (ReportLedger.day() !== batch.day) throw new HelperError('REPORT_DAY_CHANGED', '已跨北京时间日期，请重新启动举报。');
+        if (filterSignature && ReviewDOM.filterSignature() !== filterSignature) {
+          throw new HelperError('FILTER_CHANGED', '举报期间查询条件改变，已停止。');
+        }
+      };
+      try {
+        const quota = ReportLedger.quota(batch.day);
+        if (ReportLedger.journal().attempts.some(entry => ['submitting', 'submitted_unverified'].includes(entry.status))) {
+          throw new HelperError('UNRESOLVED_REPORT_HISTORY', '存在待核验举报提交，请先核验本机举报台账。');
+        }
+        batch.target = Math.min(p.n ?? Config.reportDailyLimit, quota.remaining);
+        if (!batch.target) {
+          batch.stopReason = 'daily_limit';
+        } else {
+          await Wait.until(() => DOM.root() && ReviewDOM.form(true) && ReviewDOM.table(true) &&
+            Config.reportStars.every(label => DOM.resolve(label)),
+          { ...options, timeoutMs: Config.resultTimeoutMs, description: '等待评价举报页面加载' });
+          batch.shop = ReviewDOM.shopLabel();
+          if (ReviewDOM.modals().length) throw new HelperError('EXISTING_MODAL', '页面已有弹框，举报前停止。');
+          if (ReviewDOM.goods().value !== p.goodsId) ReviewDOM.setValue(ReviewDOM.goods(), p.goodsId);
+          await Wait.until(() => ReviewDOM.goods().value === p.goodsId, { ...options, description: '核验举报商品ID' });
+          const residuals = ReviewDOM.all('input, textarea', ReviewDOM.form()).filter(element =>
+            DOM.visible(element) && element !== ReviewDOM.goods() && !element.readOnly &&
+            !['checkbox', 'radio', 'button', 'submit', 'hidden'].includes(element.type) && element.value.trim());
+          if (residuals.length) throw new HelperError('RESIDUAL_FILTER', '存在未指定的订单号或关键词，请清空后再举报。');
+          const seen = new Set();
+          let turns = 0;
+          const turn = async direction => {
+            if (++turns > Config.maxPages) throw new HelperError('PAGE_LIMIT', '举报翻页超过保护上限。');
+            return Results.turn(direction, options);
+          };
+          for (const label of Config.reportStars) {
+            if (batch.summary.reported >= batch.target || !ReportLedger.quota(batch.day).remaining) break;
+            options.guard();
+            filterSignature = undefined;
+            batch.star = Number(label[0]);
+            batch.phase = 'querying';
+            ReportLedger.saveBatch(batch);
+            await ReportDOM.selectStar(label, options);
+            filterSignature = ReviewDOM.filterSignature();
+            batch.filters = JSON.parse(filterSignature);
+            Actions.update({ message: `正在查询${label}；本次目标成功举报${batch.target}条。` });
+            await Results.transition(() => {
+              const button = ReviewDOM.queryButton();
+              if (!DOM.enabled(button)) throw new HelperError('QUERY_DISABLED', '查询按钮不可用。');
+              button.click();
+            }, options, 1);
+            batch.phase = 'reporting';
+            ReportLedger.saveBatch(batch);
+            while (batch.summary.reported < batch.target && ReportLedger.quota(batch.day).remaining) {
+              options.guard();
+              await Results.stable(options);
+              const current = Results.nextRecord(seen, batch.shop);
+              if (!current) {
+                if (!ReviewDOM.canTurn(ReviewDOM.page().next)) break;
+                if (!ReviewDOM.groups().length) throw new HelperError('INCONSISTENT_EMPTY_PAGE', '举报空页仍可翻页。');
+                await turn('next');
+                continue;
+              }
+              const group = ReviewDOM.find(current);
+              if (!group || ReportDOM.stars(group) !== batch.star) {
+                throw new HelperError('REPORT_STAR_MISMATCH', '查询结果星级与当前处理星级不一致。');
+              }
+              if (p.goodsId && current.goodsId !== p.goodsId) {
+                throw new HelperError('GOODS_FILTER_MISMATCH', '举报查询包含其他商品。');
+              }
+              const rec = { ...current, star: batch.star, rank: batch.records.length + 1, status: 'pending' };
+              seen.add(rec.key);
+              batch.records.push(rec);
+              ReportLedger.saveBatch(batch);
+              Actions.update({ message: `${label}：正在检查第${rec.rank}条；成功举报${batch.summary.reported}/${batch.target}条。` });
+              const prior = ReportLedger.previous(rec);
+              if (prior && ['submitting', 'submitted_unverified'].includes(prior.status)) {
+                throw new HelperError('UNRESOLVED_REPORT_HISTORY', '该评价存在未知举报，未重复提交。');
+              }
+              if (prior?.status === 'confirmed') rec.status = 'skipped_previously_reported';
+              else if (rec.content !== Config.reportContent) rec.status = 'skipped_non_template';
+              else if (ReportDOM.reported(group)) rec.status = 'skipped_already_reported';
+              else await Reports.submit(rec, batch, options);
+              ReportLedger.saveBatch(batch);
+              Actions.update({ message: `${label}：成功举报${batch.summary.reported}/${batch.target}条；检查${batch.summary.checked}条，跳过${batch.summary.skipped}条。` });
+              if (rec.status === 'confirmed' && batch.summary.reported < batch.target) {
+                while (ReviewDOM.page().number > 1) {
+                  if (!await turn('prev')) throw new HelperError('CANNOT_RETURN_FIRST', '举报后无法返回第一页。');
+                }
+              }
+            }
+          }
+          batch.stopReason = !ReportLedger.quota(batch.day).remaining ? 'daily_limit'
+            : batch.summary.reported >= batch.target ? 'target_reached' : 'stars_exhausted';
+        }
+        batch.phase = 'completed';
+        batch.completedAt = new Date().toISOString();
+        ReportLedger.saveBatch(batch);
+        const descriptions = { daily_limit: '今日额度已用完', target_reached: '已达到本次成功举报目标',
+          stars_exhausted: '1星、2星、3星结果均已处理完' };
+        Actions.update({ tone: 'success', message: `举报结束：成功${batch.summary.reported}条，检查${batch.summary.checked}条，跳过${batch.summary.skipped}条。${descriptions[batch.stopReason]}。` });
+        return { ok: true, ...batch.summary, quota: ReportLedger.quota(), batch };
+      } catch (error) {
+        batch.phase = 'stopped';
+        batch.error = { code: error.code || error.name, message: error.message };
+        ReportLedger.saveBatch(batch);
+        throw error;
+      }
+    }
+    return Object.freeze({ execute });
+  })();
+
   const Workflow = (() => {
     let navigating = false;
     function params(value = {}) {
@@ -773,6 +1170,18 @@
       const goodsId = value.goodsId === undefined || value.goodsId === null ? '' : String(value.goodsId).trim();
       if (goodsId && !/^\d+$/.test(goodsId)) throw new HelperError('INVALID_GOODS_ID', '商品ID必须是完整数字，或留空。');
       return { n, goodsId };
+    }
+    function reportParams(value = {}) {
+      let p;
+      try { p = params(value); } catch (error) {
+        if (error.code === 'INVALID_N') throw new HelperError('INVALID_REPORT_N',
+          '举报数量必须为1至30的整数，留空使用今日剩余额度。');
+        throw error;
+      }
+      if (p.n !== null && p.n > Config.reportDailyLimit) {
+        throw new HelperError('INVALID_REPORT_N', '举报数量必须为1至30，留空使用今日剩余额度。');
+      }
+      return p;
     }
     async function execute(p, job) {
       const options = job.options;
@@ -791,6 +1200,11 @@
         shop, params: p, phase: 'querying', records: [] };
       Ledger.saveBatch(batch);
       try {
+        // 从举报模式回到回复模式时，清除低星筛选，回复仍只选择4星、5星、未回复。
+        for (const label of Config.reportStars) {
+          const element = DOM.resolve(label);
+          if (element && DOM.selected(element)) await ReportDOM.toggle(label, false, options);
+        }
         await Actions.selectForBatch(job);
         options.guard();
         // 未指定也写入空值，清除页面残留ID；绝不静默继承旧查询条件。
@@ -875,12 +1289,13 @@
         throw error;
       }
     }
-    function navigate(p) {
+    function navigate(p, taskMode = 'reply') {
       if (navigating || Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
-      Ledger.write(sessionStorage, Config.pendingKey, { schema: 3, action: 'start-batch',
+      Ledger.write(sessionStorage, Config.pendingKey, { schema: taskMode === 'report' ? 4 : 3,
+        action: taskMode === 'report' ? 'report-batch' : 'start-batch',
         sourceUrl: location.href, params: p, at: Date.now() });
       navigating = true;
-      Actions.update({ busy: true, tone: 'info', message: '正在进入评价页，随后自动执行…' });
+      Actions.update({ busy: true, taskMode, tone: 'info', message: '正在进入评价页，随后自动执行…' });
       try {
         location.assign(Config.evaluationUrl);
       } catch (error) {
@@ -896,38 +1311,43 @@
     }
     function cancel() {
       // 先同步中断本页等待，再清除跳转交接；即使存储失败也不继续当前批次。
+      const taskMode = Actions.status().busy ? Actions.status().taskMode : Panel.taskMode();
       const stopped = Actions.cancel();
       const hadPending = Ledger.remove(sessionStorage, Config.pendingKey);
       if (navigating || hadPending) {
         // 浏览器导航可能已经发出；保留导航锁直到离开/返回，防止再次启动。
-        Actions.update({ tone: 'info',
-          message: '已急停：待执行任务已清除，评价页加载后不会继续。已提交的回复无法撤销。' });
+        Actions.update({ taskMode, tone: 'info',
+          message: '已急停：待执行任务已清除，评价页加载后不会继续。已提交的操作无法撤销。' });
       } else if (stopped) {
-        Actions.update({ tone: 'info', message: '已请求急停，正在结束当前操作；已提交的回复无法撤销。' });
+        Actions.update({ taskMode, tone: 'info', message: '已请求急停，正在结束当前操作；已提交的操作无法撤销。' });
       } else {
-        Actions.update({ tone: 'info', message: '当前没有正在执行的任务。' });
+        Actions.update({ taskMode, tone: 'info', message: '当前没有正在执行的任务。' });
       }
       return stopped || navigating || hadPending;
     }
     // 已在评价路径直接操作，保留URL参数及页面日期；其他后台页面同标签页跳转。
-    async function start(value) {
-      const p = params(value);
+    async function start(value, taskMode = 'reply') {
+      const p = taskMode === 'report' ? reportParams(value) : params(value);
       if (navigating || Actions.status().busy) throw new HelperError('BUSY', '已有操作正在执行。');
-      if (!/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) return navigate(p);
+      Panel.setTaskMode(taskMode);
+      if (!/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) return navigate(p, taskMode);
       return Actions.runTask(async job => {
         if (!navigator.locks?.request) throw new HelperError('LOCK_UNAVAILABLE', '当前浏览器不支持批次互斥锁，未开始提交。');
         return navigator.locks.request(Config.lockName, { ifAvailable: true }, async lock => {
           if (!lock) throw new HelperError('OTHER_TAB_BUSY', '另一个后台标签页正在执行批次，请等待完成。');
-          return execute(p, job);
+          return taskMode === 'report' ? ReportWorkflow.execute(p, job) : execute(p, job);
         });
-      });
+      }, taskMode);
     }
     function validPending(pending) {
       // 接受前两版完整导航参数；旧店铺约束不再参与执行。
-      if (![1, 2, 3].includes(pending.schema) || !pending.params || Array.isArray(pending.params)) return false;
+      if (![1, 2, 3, 4].includes(pending.schema) || !pending.params || Array.isArray(pending.params)) return false;
       const p = pending.params;
       if (!(p.n === null || Number.isSafeInteger(p.n) && p.n > 0) ||
           typeof p.goodsId !== 'string' || !/^\d*$/.test(p.goodsId)) return false;
+      if (pending.schema === 4 && (pending.action !== 'report-batch' ||
+          p.n !== null && p.n > Config.reportDailyLimit)) return false;
+      if (pending.schema !== 4 && pending.action !== 'start-batch') return false;
       if (pending.schema === 1) return true;
       if (typeof pending.sourceUrl !== 'string') return false;
       try {
@@ -937,19 +1357,22 @@
       }
     }
     async function continueNavigation() {
+      let taskMode = Panel.taskMode();
       try {
         const pending = Ledger.read(sessionStorage, Config.pendingKey, null);
         if (!pending) return;
+        taskMode = pending.action === 'report-batch' ? 'report' : taskMode;
         Ledger.remove(sessionStorage, Config.pendingKey); // 验证消费成功，刷新不会重新自动提交。
-        if (!validPending(pending) || pending.action !== 'start-batch' || !Number.isFinite(pending.at) ||
+        if (!validPending(pending) || !Number.isFinite(pending.at) ||
             Date.now() - pending.at < 0 || Date.now() - pending.at > 120000 ||
             !/^\/goods\/evaluation\/index\/?$/.test(location.pathname)) {
           throw new HelperError('EXPIRED_START', '跳转任务已过期或页面不符，请手动重新启动。');
         }
-        Panel.setParams(pending.params);
-        await start(pending.params);
+        taskMode = pending.action === 'report-batch' ? 'report' : 'reply';
+        Panel.setParams(pending.params, taskMode);
+        await start(pending.params, taskMode);
       } catch (error) {
-        Actions.update({ tone: 'error', message: error.message });
+        Actions.update({ taskMode, tone: 'error', message: error.message });
       }
     }
     function restoreNavigation() {
@@ -957,7 +1380,8 @@
       navigating = false;
       Actions.update({ busy: false, tone: 'info', message: '已返回页面，点击“一键运行”可重新启动。' });
     }
-    return Object.freeze({ start, oneClickRun, cancel, continueNavigation, restoreNavigation });
+    return Object.freeze({ start, oneClickRun, startReport: value => start(value, 'report'),
+      cancel, continueNavigation, restoreNavigation });
   })();
 
   const Panel = (() => {
@@ -965,6 +1389,9 @@
     let shadow;
     let lastRender = '';
     let checkedAt = '';
+    let reportCheckedAt = '';
+    const modeStatus = { reply: { tone: 'info', message: '设置参数后点击“一键运行”。' },
+      report: { tone: 'info', message: '设置成功举报数量后点击“一键运行”。' } };
     let drag;
     let layout = readLayout();
     function readLayout() {
@@ -972,10 +1399,11 @@
         const value = JSON.parse(localStorage.getItem(Config.panelKey) || 'null');
         if (value?.schema === 1 && ['expanded', 'collapsed', 'minimized'].includes(value.mode) &&
             (value.x === null && value.y === null || Number.isFinite(value.x) && Number.isFinite(value.y))) {
-          return { schema: 1, mode: value.mode, x: value.x, y: value.y };
+          return { schema: 1, mode: value.mode, x: value.x, y: value.y,
+            taskMode: value.taskMode === 'report' ? 'report' : 'reply' };
         }
       } catch { /* 面板偏好失效不影响业务台账。 */ }
-      return { schema: 1, mode: 'expanded', x: null, y: null };
+      return { schema: 1, mode: 'expanded', x: null, y: null, taskMode: 'reply' };
     }
     function saveLayout() {
       try { localStorage.setItem(Config.panelKey, JSON.stringify(layout)); } catch { /* 使用内存中的布局。 */ }
@@ -996,18 +1424,37 @@
     function applyLayout() {
       const section = shadow.querySelector('section');
       section.dataset.mode = layout.mode;
-      shadow.querySelector('#body').hidden = layout.mode !== 'expanded';
+      shadow.querySelector('#body').hidden = layout.mode !== 'expanded' || layout.taskMode !== 'reply';
+      shadow.querySelector('#report-body').hidden = layout.mode !== 'expanded' || layout.taskMode !== 'report';
+      shadow.querySelector('#mode-switch').hidden = layout.mode !== 'expanded';
       shadow.querySelector('#drag-handle').hidden = layout.mode === 'minimized';
       shadow.querySelector('#minibar').hidden = layout.mode !== 'minimized';
       shadow.querySelector('#compact').hidden = layout.mode === 'expanded';
       const toggle = shadow.querySelector('#collapse');
       toggle.textContent = layout.mode === 'collapsed' ? '展开' : '收起';
       toggle.setAttribute('aria-expanded', String(layout.mode === 'expanded'));
+      shadow.querySelector('#mode-reply').setAttribute('aria-pressed', String(layout.taskMode === 'reply'));
+      shadow.querySelector('#mode-report').setAttribute('aria-pressed', String(layout.taskMode === 'report'));
+      shadow.querySelector('#panel-title').textContent = layout.taskMode === 'report' ? 'PDD 自动举报差评' : 'PDD 自动筛选回复';
+      shadow.querySelector('#minibar strong').textContent = layout.taskMode === 'report' ? 'PDD 举报差评' : 'PDD 评价助手';
       place();
     }
     function setMode(mode) {
       layout.mode = mode;
       applyLayout();
+      saveLayout();
+    }
+    function setTaskMode(mode) {
+      if (!['reply', 'report'].includes(mode)) throw new HelperError('INVALID_MODE', '未知执行模式。');
+      if (Actions.status().busy && layout.taskMode !== mode) {
+        throw new HelperError('BUSY', '运行中不能切换模式，请先急停或等待完成。');
+      }
+      layout.taskMode = mode;
+      if (shadow) {
+        applyLayout();
+        lastRender = '';
+        render();
+      }
       saveLayout();
     }
     function beginDrag(event) {
@@ -1071,6 +1518,31 @@
       }
     }
 
+    function reportInspection() {
+      try {
+        const quota = ReportLedger.quota();
+        const batch = ReportLedger.lastBatch();
+        let message = `今日成功举报${quota.confirmed}条；待核验${quota.uncertain}条；剩余额度${quota.remaining}/${quota.limit}条。`;
+        message += DOM.root() ? '\n按1星→2星→3星处理；仅匹配无文字评价。'
+          : '\n当前页面可启动；一键运行自动进入评价页。';
+        if (batch) {
+          const phases = { querying: '筛选与查询', reporting: '逐条检查与举报',
+            completed: '已完成', stopped: '已停止' };
+          const reasons = { daily_limit: '今日额度用完', target_reached: '成功举报目标已达到',
+            stars_exhausted: '1至3星查询结果处理完毕' };
+          const counts = batch.summary;
+          message += `\n最近批次：${phases[batch.phase] || '未知阶段'}；当前${batch.star}星。`
+            + `\n成功举报${counts.reported}/${batch.target}条；检查${counts.checked}条；跳过${counts.skipped}条。`;
+          if (batch.stopReason) message += `\n结束原因：${reasons[batch.stopReason] || batch.stopReason}。`;
+          if (batch.error?.message) message += `\n停止原因：${batch.error.message}`;
+        } else message += '\n尚无举报批次记录。';
+        if (reportCheckedAt) message += `\n手动检查：${reportCheckedAt}；状态持续自动更新。`;
+        return { message, tone: quota.uncertain ? 'error' : 'info' };
+      } catch (error) {
+        return { message: `举报状态读取失败：${error.message}`, tone: 'error' };
+      }
+    }
+
     function mount() {
       if (host?.isConnected) return;
       host = document.createElement('div');
@@ -1104,32 +1576,35 @@
           button:hover:enabled { border-color: #e02e24; background: #fff5f4; }
           button:focus-visible { outline: 2px solid #e02e24; outline-offset: 2px; }
           button:disabled { opacity: .45; cursor: not-allowed; }
-          #body { padding: 12px 14px 14px; max-height: calc(100vh - 120px); overflow: auto; }
+          #mode-switch { display: flex; gap: 6px; padding: 10px 14px 0; }
+          #mode-switch button { flex: 1; font-size: 12px; }
+          #mode-switch [aria-pressed="true"] { color: #b32c22; border-color: #e02e24; background: #fff5f4; }
+          #body, #report-body { padding: 8px 14px 14px; max-height: calc(100vh - 174px); overflow: auto; }
           [hidden] { display: none !important; }
-          #status { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; font-size: 12px; color: #626b7a; }
-          #status[data-tone="success"] { color: #207442; }
-          #status[data-tone="error"] { color: #b32c22; }
+          #status, #report-status { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; font-size: 12px; color: #626b7a; }
+          #status[data-tone="success"], #report-status[data-tone="success"] { color: #207442; }
+          #status[data-tone="error"], #report-status[data-tone="error"] { color: #b32c22; }
           .tools { display: flex; gap: 6px; margin-top: 9px; }
           .tools button { padding: 4px 9px; font-size: 12px; }
-          #inspection { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; padding: 8px;
+          #inspection, #report-inspection { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; padding: 8px;
             border-radius: 6px; background: #f6f7fa; font-size: 12px; color: #626b7a; }
-          #inspection[data-tone="error"] { color: #b32c22; }
+          #inspection[data-tone="error"], #report-inspection[data-tone="error"] { color: #b32c22; }
           .hint { color: #737c8c; margin: 9px 0 0; font-size: 11px; }
           label { display: block; font-size: 12px; margin-top: 6px; }
           input { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid #dce0e7; border-radius: 6px; }
-          #run-once { width: 100%; margin-top: 12px; background: #e02e24; color: white; border-color: #e02e24; }
-          #run-once:hover:enabled { background: #c8241b; }
-          #stop { width: 100%; margin-top: 6px; color: #b32c22; border-color: #c43a30; background: #fff5f4; }
-          #stop:hover:enabled { color: #fff; background: #b32c22; }
+          #run-once, #report-run-once { width: 100%; margin-top: 12px; background: #e02e24; color: white; border-color: #e02e24; }
+          #run-once:hover:enabled, #report-run-once:hover:enabled { background: #c8241b; }
+          #stop, #report-stop { width: 100%; margin-top: 6px; color: #b32c22; border-color: #c43a30; background: #fff5f4; }
+          #stop:hover:enabled, #report-stop:hover:enabled { color: #fff; background: #b32c22; }
           details { margin-top: 9px; font-size: 12px; color: #626b7a; }
           summary { cursor: pointer; }
-          #reply-copy { margin: 6px 0 0; overflow-wrap: anywhere; }
+          #reply-copy, #report-copy { margin: 6px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
         </style>
-        <section aria-label="PDD评价自动回复">
+        <section aria-label="PDD评价助手">
           <header id="drag-handle" title="拖动标题栏移动面板">
-            <div><strong>PDD 评价自动回复</strong><span class="version">${Config.version}</span></div>
+            <div><strong id="panel-title">PDD 自动筛选回复</strong><span class="version">${Config.version}</span></div>
             <div class="window-tools">
-              <button id="collapse" type="button" aria-controls="body" aria-expanded="true">收起</button>
+              <button id="collapse" type="button" aria-controls="body report-body mode-switch" aria-expanded="true">收起</button>
               <button id="minimize" type="button" aria-label="最小化控制面板">最小化</button>
             </div>
           </header>
@@ -1137,6 +1612,10 @@
             <button id="restore" type="button" aria-label="恢复控制面板">恢复</button></div>
           <div id="compact" hidden><p id="compact-count" role="status" aria-live="polite"></p>
             <button id="compact-stop" type="button">急停</button></div>
+          <div id="mode-switch" role="group" aria-label="执行模式">
+            <button id="mode-reply" type="button" aria-pressed="true">自动筛选回复</button>
+            <button id="mode-report" type="button" aria-pressed="false">自动举报差评</button>
+          </div>
           <div id="body">
             <label for="batch-n">检查数量 N（留空＝全部结果）</label>
             <input id="batch-n" type="text" inputmode="numeric" placeholder="例如 5；N不是回复数量">
@@ -1154,11 +1633,39 @@
             <details id="reply-details"><summary>查看统一回复文案</summary><p id="reply-copy"></p></details>
             <p class="hint">评价页直接运行，其他后台页自动跳转。逐条检查，符合正文条件立即回复；N留空遍历结果。</p>
           </div>
+          <div id="report-body" hidden>
+            <label for="report-n">举报数量（本次成功数量）</label>
+            <input id="report-n" type="text" inputmode="numeric" placeholder="1～30；留空使用今日剩余额度">
+            <label for="report-goods">商品 ID（可选）</label>
+            <input id="report-goods" type="text" inputmode="numeric" placeholder="留空查询全部商品">
+            <button id="report-run-once" type="button">一键运行</button>
+            <button id="report-stop" type="button" aria-describedby="report-stop-help">急停</button>
+            <p id="report-stop-help" class="hint">停止后续操作；已提交的举报无法撤销。</p>
+            <p id="report-status" role="status" aria-live="polite"></p>
+            <div class="tools">
+              <button id="report-refresh" type="button">检查状态</button>
+              <button id="report-export-batch" type="button">导出本机台账</button>
+            </div>
+            <p id="report-inspection" role="status" aria-live="polite"></p>
+            <details id="report-details"><summary>查看统一举报文案</summary><p id="report-copy"></p></details>
+            <p class="hint">评价页直接运行，其他后台页自动跳转。按1星→2星→3星处理，仅举报正文完全等于“该用户未填写文字评价”的记录。每天最多30条，跳过不占目标；提交成功表示平台已接收。</p>
+          </div>
         </section>`;
       shadow.querySelector('#run-once').addEventListener('click', () => {
         void Workflow.oneClickRun({ n: shadow.querySelector('#batch-n').value,
           goodsId: shadow.querySelector('#batch-goods').value })
-          .catch(error => Actions.update({ tone: 'error', message: error.message }));
+          .catch(error => Actions.update({ taskMode: 'reply', tone: 'error', message: error.message }));
+      });
+      shadow.querySelector('#report-run-once').addEventListener('click', () => {
+        void Workflow.startReport({ n: shadow.querySelector('#report-n').value,
+          goodsId: shadow.querySelector('#report-goods').value })
+          .catch(error => Actions.update({ taskMode: 'report', tone: 'error', message: error.message }));
+      });
+      for (const taskMode of ['reply', 'report']) {
+        shadow.querySelector(`#mode-${taskMode}`).addEventListener('click', () => setTaskMode(taskMode));
+      }
+      shadow.querySelector('#report-stop').addEventListener('click', () => {
+        try { Workflow.cancel(); } catch (error) { Actions.update({ taskMode: 'report', tone: 'error', message: error.message }); }
       });
       shadow.querySelector('#stop').addEventListener('click', () => {
         try { Workflow.cancel(); } catch (error) { Actions.update({ tone: 'error', message: error.message }); }
@@ -1184,14 +1691,23 @@
         handle.addEventListener('lostpointercapture', endDrag);
       }
       shadow.querySelector('#reply-details').addEventListener('toggle', place);
+      shadow.querySelector('#report-details').addEventListener('toggle', place);
       shadow.querySelector('#refresh').addEventListener('click', () => {
         checkedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         render();
       });
       shadow.querySelector('#export-batch').addEventListener('click', () => {
-        try { Ledger.exportData(); } catch (error) { Actions.update({ tone: 'error', message: error.message }); }
+        try { Ledger.exportData(); } catch (error) { Actions.update({ taskMode: 'reply', tone: 'error', message: error.message }); }
+      });
+      shadow.querySelector('#report-refresh').addEventListener('click', () => {
+        reportCheckedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        render();
+      });
+      shadow.querySelector('#report-export-batch').addEventListener('click', () => {
+        try { ReportLedger.exportData(); } catch (error) { Actions.update({ taskMode: 'report', tone: 'error', message: error.message }); }
       });
       shadow.querySelector('#reply-copy').textContent = Config.replyText;
+      shadow.querySelector('#report-copy').textContent = Config.reportText;
       document.body.append(host);
       applyLayout();
       window.addEventListener('resize', resize);
@@ -1203,26 +1719,37 @@
       // @match和入口已限定商家后台域名；面板不再依赖评价页地址或筛选DOM。
       const status = Actions.status();
       const reading = inspection();
+      const reportReading = reportInspection();
+      if (status.taskMode && status.message) modeStatus[status.taskMode] = { tone: status.tone, message: status.message };
       // 高频mutation不反复更新相同的面板内容。
-      const fingerprint = JSON.stringify({ status, reading });
+      const fingerprint = JSON.stringify({ status, reading, reportReading, taskMode: layout.taskMode, modeStatus });
       if (fingerprint === lastRender) return;
       lastRender = fingerprint;
       shadow.querySelector('#run-once').disabled = status.busy;
       shadow.querySelector('#batch-n').disabled = status.busy;
       shadow.querySelector('#batch-goods').disabled = status.busy;
+      for (const id of ['report-run-once', 'report-n', 'report-goods', 'mode-reply', 'mode-report']) {
+        shadow.querySelector(`#${id}`).disabled = status.busy;
+      }
       const feedback = shadow.querySelector('#status');
-      feedback.textContent = status.message;
-      feedback.dataset.tone = status.tone;
+      feedback.textContent = modeStatus.reply.message;
+      feedback.dataset.tone = modeStatus.reply.tone;
       const details = shadow.querySelector('#inspection');
       details.textContent = reading.message;
       details.dataset.tone = reading.tone;
-      const batch = Ledger.lastBatch();
+      shadow.querySelector('#report-status').textContent = modeStatus.report.message;
+      shadow.querySelector('#report-status').dataset.tone = modeStatus.report.tone;
+      shadow.querySelector('#report-inspection').textContent = reportReading.message;
+      shadow.querySelector('#report-inspection').dataset.tone = reportReading.tone;
+      const batch = layout.taskMode === 'report' ? ReportLedger.lastBatch() : Ledger.lastBatch();
       const counts = batch?.summary;
       const compact = shadow.querySelector('#compact-count');
       const label = status.busy ? '运行中' : batch?.phase === 'stopped' ? '已停止'
         : batch?.phase === 'completed' ? '已完成' : '待运行';
-      compact.textContent = `${label}${counts ? ` · 检查${counts.checked} · 回复${counts.replied}` : ''}`;
-      compact.dataset.tone = status.tone;
+      compact.textContent = `${label}${counts ? layout.taskMode === 'report'
+        ? ` · 成功举报${counts.reported}/${batch.target} · 检查${counts.checked}`
+        : ` · 检查${counts.checked} · 回复${counts.replied}` : ''}`;
+      compact.dataset.tone = modeStatus[layout.taskMode].tone;
       place();
     }
 
@@ -1235,13 +1762,14 @@
       lastRender = '';
     }
 
-    function setParams(params) {
+    function setParams(params, taskMode = 'reply') {
       mount();
-      shadow.querySelector('#batch-n').value = params.n === null ? '' : String(params.n);
-      shadow.querySelector('#batch-goods').value = params.goodsId || '';
+      setTaskMode(taskMode);
+      shadow.querySelector(taskMode === 'report' ? '#report-n' : '#batch-n').value = params.n === null ? '' : String(params.n);
+      shadow.querySelector(taskMode === 'report' ? '#report-goods' : '#batch-goods').value = params.goodsId || '';
     }
 
-    return Object.freeze({ render, destroy, setParams,
+    return Object.freeze({ render, destroy, setParams, setTaskMode, taskMode: () => layout.taskMode,
       contains: (node) => Boolean(host && (node === host || host.contains(node))) });
   })();
 
@@ -1324,6 +1852,13 @@
       readState: DOM.snapshot,
       startBatch: Workflow.start,
       oneClickRun: Workflow.oneClickRun,
+      startReportBatch: Workflow.startReport,
+      oneClickReportRun: Workflow.startReport,
+      readReportBatch: ReportLedger.lastBatch,
+      readReportJournal: ReportLedger.journal,
+      readReportQuota: ReportLedger.quota,
+      exportReportLedger: ReportLedger.exportData,
+      resolveReportSubmission: ReportLedger.resolve,
       exportLedger: Ledger.exportData,
       readBatch: Ledger.lastBatch,
       readSubmissionJournal: Ledger.journal,
