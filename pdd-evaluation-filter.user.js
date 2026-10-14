@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-14.5
+// @name         PDD评价筛选助手 v2026-10-14.6
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-14.5
+// @version      2026-10-14.6
 // @description  PDD自动筛选回复与差评举报双模式，支持独立计数、每日举报限额、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-14.5',
+    version: '2026-10-14.6',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -780,8 +780,9 @@
         return { signature, page: ReviewDOM.page() };
       }, { ...options, timeoutMs: Config.resultTimeoutMs, stableMs: Config.resultStableMs, description });
     }
-    async function transition(click, options, targetPage) {
-      const before = ReviewDOM.fingerprint();
+    async function transition(click, options, targetPage, currentTableOnly = false) {
+      const fingerprint = currentTableOnly ? ReviewDOM.tableFingerprint : ReviewDOM.fingerprint;
+      const before = fingerprint();
       let activity = false;
       const table = ReviewDOM.table();
       const observer = new MutationObserver(records => {
@@ -797,12 +798,14 @@
         options.guard();
         click();
         await Wait.until(() => {
-          if (ReviewDOM.busy() || ReviewDOM.fingerprint() !== before) activity = true;
+          if (ReviewDOM.busy()) { activity = true; return false; }
+          if (fingerprint() !== before) activity = true;
+          if (currentTableOnly) return activity;
           const page = ReviewDOM.page();
-          return activity && !ReviewDOM.busy() && (targetPage === undefined || page.number === targetPage);
+          return activity && (targetPage === undefined || page.number === targetPage);
         }, { ...options, timeoutMs: Config.resultTimeoutMs, stableMs: 0,
           description: `等待查询/翻页完成${targetPage ? `（第${targetPage}页）` : ''}` });
-        return await stable(options);
+        return await (currentTableOnly ? currentTableStable(options) : stable(options));
       } finally {
         observer.disconnect();
       }
@@ -838,7 +841,9 @@
       }
       return records.find(rec => !seen.has(rec.key)) || null;
     }
-    return Object.freeze({ currentTableStable, stable, transition, first, turn, nextRecord });
+    return Object.freeze({ currentTableStable, stable, transition,
+      transitionCurrentTable: (click, options) => transition(click, options, undefined, true),
+      first, turn, nextRecord });
   })();
 
   const Replies = (() => {
@@ -1430,15 +1435,88 @@
         }
       };
       try {
-        const recovered = await ReportLedger.reconcile(options);
-        batch.reconciled = recovered.map(entry => ({ id: entry.id, day: entry.day, key: entry.key }));
-        const eligibleRecovered = recovered.filter(entry =>
-          entry.day === batch.day && (!p.goodsId || entry.goodsId === p.goodsId));
-        const quota = ReportLedger.quota(batch.day);
-        batch.target = Math.min(p.n ?? Config.reportDailyLimit, quota.remaining + eligibleRecovered.length);
-        batch.records = eligibleRecovered.slice(0, batch.target).map((entry, index) =>
-          ({ ...entry, rank: index + 1 }));
-        ReportLedger.saveBatch(batch);
+        let pagePrepared = false;
+        let queriedStar = null;
+        let queriedGoods = null;
+        let turns = 0;
+        const turn = async direction => {
+          if (++turns > Config.maxPages) throw new HelperError('PAGE_LIMIT', '举报翻页超过保护上限。');
+          return Results.turn(direction, options);
+        };
+        const preparePage = async () => {
+          if (pagePrepared) return;
+          await Wait.until(() => DOM.root() && ReviewDOM.form(true) && ReviewDOM.table(true) &&
+            Config.reportStars.every(label => DOM.resolve(label)),
+          { ...options, timeoutMs: Config.resultTimeoutMs, description: '等待评价举报页面加载' });
+          batch.shop = ReviewDOM.shopLabel();
+          if (ReviewDOM.modals().length) throw new HelperError('EXISTING_MODAL', '页面已有弹框，举报前停止。');
+          const residuals = ReviewDOM.all('input, textarea', ReviewDOM.form()).filter(element =>
+            DOM.visible(element) && element !== ReviewDOM.goods() && !element.readOnly &&
+            !['checkbox', 'radio', 'button', 'submit', 'hidden'].includes(element.type) && element.value.trim());
+          if (residuals.length) throw new HelperError('RESIDUAL_FILTER', '存在未指定的订单号或关键词，请清空后再举报。');
+          pagePrepared = true;
+        };
+        const queryStar = async (label, reconciling = false, goodsId = p.goodsId) => {
+          await preparePage();
+          options.guard();
+          filterSignature = undefined;
+          if (ReviewDOM.goods().value !== goodsId) ReviewDOM.setValue(ReviewDOM.goods(), goodsId);
+          await Wait.until(() => ReviewDOM.goods().value === goodsId, { ...options, description: '核验举报商品ID' });
+          batch.star = Number(label[0]);
+          batch.phase = 'querying';
+          ReportLedger.saveBatch(batch);
+          await ReportDOM.selectStar(label, options);
+          filterSignature = ReviewDOM.filterSignature();
+          batch.filters = JSON.parse(filterSignature);
+          Actions.update({ message: reconciling ? `正在查询${label}，核验已有举报；核验完成前不新增提交。`
+            : `正在查询${label}；本次目标成功举报${batch.target}条。` });
+          const clickQuery = () => {
+            const button = ReviewDOM.queryButton();
+            if (!DOM.enabled(button)) throw new HelperError('QUERY_DISABLED', '查询按钮不可用。');
+            button.click();
+          };
+          if (reconciling) await Results.transitionCurrentTable(clickQuery, options);
+          else await Results.transition(clickQuery, options, 1);
+          batch.phase = reconciling ? 'reconciling' : 'reporting';
+          ReportLedger.saveBatch(batch);
+          queriedStar = label;
+          queriedGoods = goodsId;
+        };
+        const uncertain = ReportLedger.journal().attempts.filter(entry =>
+          ['submitting', 'submitted_unverified'].includes(entry.status));
+        const recovered = [];
+        const saveRecovered = () => {
+          batch.reconciled = recovered.map(entry => ({ id: entry.id, day: entry.day, key: entry.key }));
+          const eligible = recovered.filter(entry =>
+            entry.day === batch.day && (!p.goodsId || entry.goodsId === p.goodsId));
+          const quota = ReportLedger.quota(batch.day);
+          batch.target = Math.min(p.n ?? Config.reportDailyLimit, quota.remaining + eligible.length);
+          batch.records = eligible.slice(0, batch.target).map((entry, index) => ({ ...entry, rank: index + 1 }));
+          ReportLedger.saveBatch(batch);
+        };
+        if (uncertain.length) {
+          const highestUncertainStar = Math.max(...uncertain.map(entry =>
+            [1, 2, 3].includes(entry.star) ? entry.star : 1));
+          // 核验读取已有提交；指定商品以外的未知历史也需核验，临时查询商品不限。
+          // 恢复完成后，新举报查询重新使用用户本次指定的商品。
+          const recoveryGoods = p.goodsId && uncertain.some(entry => entry.goodsId !== p.goodsId) ? '' : p.goodsId;
+          for (const label of Config.reportStars.slice(0, highestUncertainStar)) {
+            await queryStar(label, true, recoveryGoods);
+            while (true) {
+              recovered.push(...await ReportLedger.reconcile(options));
+              saveRecovered();
+              const pending = ReportLedger.journal().attempts.filter(entry =>
+                ['submitting', 'submitted_unverified'].includes(entry.status) && entry.star === Number(label[0]));
+              // 已找到但证据不足不扩大查找；尚未找到的同星级记录才继续翻页核验。
+              if (!pending.length || pending.some(entry => entry.submissionDiagnostics?.rowFound) ||
+                  !ReviewDOM.canTurn(ReviewDOM.page().next)) break;
+              await turn('next');
+            }
+            if (!ReportLedger.journal().attempts.some(entry =>
+              ['submitting', 'submitted_unverified'].includes(entry.status))) break;
+          }
+        }
+        saveRecovered();
         if (ReportLedger.journal().attempts.some(entry => ['submitting', 'submitted_unverified'].includes(entry.status))) {
           throw new HelperError('UNRESOLVED_REPORT_HISTORY', '存在待核验举报提交，请先核验本机举报台账。');
         }
@@ -1447,41 +1525,20 @@
         } else if (batch.summary.reported >= batch.target) {
           batch.stopReason = 'target_reached';
         } else {
-          await Wait.until(() => DOM.root() && ReviewDOM.form(true) && ReviewDOM.table(true) &&
-            Config.reportStars.every(label => DOM.resolve(label)),
-          { ...options, timeoutMs: Config.resultTimeoutMs, description: '等待评价举报页面加载' });
-          batch.shop = ReviewDOM.shopLabel();
-          if (ReviewDOM.modals().length) throw new HelperError('EXISTING_MODAL', '页面已有弹框，举报前停止。');
-          if (ReviewDOM.goods().value !== p.goodsId) ReviewDOM.setValue(ReviewDOM.goods(), p.goodsId);
-          await Wait.until(() => ReviewDOM.goods().value === p.goodsId, { ...options, description: '核验举报商品ID' });
-          const residuals = ReviewDOM.all('input, textarea', ReviewDOM.form()).filter(element =>
-            DOM.visible(element) && element !== ReviewDOM.goods() && !element.readOnly &&
-            !['checkbox', 'radio', 'button', 'submit', 'hidden'].includes(element.type) && element.value.trim());
-          if (residuals.length) throw new HelperError('RESIDUAL_FILTER', '存在未指定的订单号或关键词，请清空后再举报。');
+          await preparePage();
           const seen = new Set(batch.records.map(rec => rec.key));
-          let turns = 0;
-          const turn = async direction => {
-            if (++turns > Config.maxPages) throw new HelperError('PAGE_LIMIT', '举报翻页超过保护上限。');
-            return Results.turn(direction, options);
-          };
           for (const label of Config.reportStars) {
             if (batch.summary.reported >= batch.target || !ReportLedger.quota(batch.day).remaining) break;
             options.guard();
-            filterSignature = undefined;
-            batch.star = Number(label[0]);
-            batch.phase = 'querying';
-            ReportLedger.saveBatch(batch);
-            await ReportDOM.selectStar(label, options);
-            filterSignature = ReviewDOM.filterSignature();
-            batch.filters = JSON.parse(filterSignature);
-            Actions.update({ message: `正在查询${label}；本次目标成功举报${batch.target}条。` });
-            await Results.transition(() => {
-              const button = ReviewDOM.queryButton();
-              if (!DOM.enabled(button)) throw new HelperError('QUERY_DISABLED', '查询按钮不可用。');
-              button.click();
-            }, options, 1);
-            batch.phase = 'reporting';
-            ReportLedger.saveBatch(batch);
+            if (queriedStar !== label || queriedGoods !== p.goodsId) await queryStar(label);
+            else {
+              while (ReviewDOM.page().number > 1) {
+                if (!await turn('prev')) throw new HelperError('CANNOT_RETURN_FIRST', '核验后无法返回第一页。');
+              }
+              batch.star = Number(label[0]);
+              batch.phase = 'reporting';
+              ReportLedger.saveBatch(batch);
+            }
             while (batch.summary.reported < batch.target && ReportLedger.quota(batch.day).remaining) {
               options.guard();
               await Results.stable(options);

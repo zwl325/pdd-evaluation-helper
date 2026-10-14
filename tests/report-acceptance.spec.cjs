@@ -34,6 +34,7 @@ async function seedUnknown(page, changes = {}) {
       reportText, reason: '同行恶意差评', evidence: 'TIMEOUT', at: new Date().toISOString(),
       history: [{ status: 'submitting', at: new Date().toISOString() }], ...changes };
     localStorage.setItem('pdd-evaluation-helper:reports:v1', JSON.stringify({ schema: 1, attempts: [entry] }));
+    window.sim.filterStar = 4; // 模拟后台默认结果，不预先展示待核验的低星记录。
     window.renderFixture();
   }, changes);
 }
@@ -106,16 +107,113 @@ async function main() {
     assert.equal(s.quota.confirmed, 2);
     assert.equal(s.quota.uncertain, 0);
   });
-  test('核验恢复已经达到目标1时零查询零新增提交', async page => {
+  test('旧1星记录先查询1星再核验，不依赖默认结果页', async page => {
+    await seedUnknown(page);
+    await page.evaluate(() => { window.sim.filterStar = 4; window.renderFixture(); });
+    const result = await run(page, { n: 1 });
+    assert.equal(result.reported, 1, result.message);
+    const s = await state(page);
+    assert.equal(s.queries[0].star, 1);
+    assert.equal(s.submissions.length, 0);
+    assert.equal(s.batch.reconciled.length, 1);
+    assert.ok(s.filterClicks.includes('1星'));
+  });
+  for (const star of [2, 3]) {
+    test(`旧${star}星记录按1星起始查询到对应星级后恢复，核验前零提交`, async page => {
+      await page.evaluate(star => { window.sim.records[0].star = star; }, star);
+      await seedUnknown(page);
+      assert.equal((await run(page)).reported, 1);
+      const s = await state(page);
+      assert.deepEqual(s.queries.map(entry => entry.star), Array.from({ length: star }, (_, i) => i + 1));
+      assert.ok(s.queries.every(entry => entry.submitted === 0));
+      assert.equal(s.submissions.length, 0);
+      assert.equal(s.quota.uncertain, 0);
+    });
+  }
+  test('旧1星订单在第二页时查询并翻页核验，零重复举报', async page => {
+    await seedUnknown(page);
+    await page.evaluate(() => {
+      window.sim.records.reverse();
+      window.sim.pageSize = 1;
+      window.renderFixture();
+    });
+    const result = await run(page);
+    assert.equal(result.reported, 1, result.message);
+    const s = await state(page);
+    assert.deepEqual(s.queries.map(entry => entry.star), [1]);
+    assert.ok(s.visits.some(entry => entry.star === 1 && entry.page === 2));
+    assert.equal(s.submissions.length, 0);
+  });
+  test('第二页恢复后返回第一页继续目标2，仅新增1条', async page => {
+    await seedUnknown(page);
+    await page.evaluate(() => {
+      window.sim.records.reverse();
+      window.sim.pageSize = 1;
+      window.renderFixture();
+    });
+    const result = await run(page, { n: 2 });
+    assert.equal(result.reported, 2, result.message);
+    const s = await state(page);
+    assert.equal(s.submissions.length, 1);
+    assert.equal(s.quota.confirmed, 2);
+    assert.equal(s.quota.uncertain, 0);
+  });
+  test('1星恢复后2星查询被禁用，已恢复计数和历史仍保留且零提交', async page => {
+    await seedUnknown(page);
+    await page.evaluate(() => {
+      const data = window.PDDEvaluationHelper.readReportJournal();
+      const rec = window.sim.records[1];
+      rec.star = 2;
+      data.attempts.push({ ...data.attempts[0], id: 'synthetic-second-unknown',
+        star: 2, order: rec.order, goodsId: rec.goodsId, time: rec.time,
+        key: JSON.stringify([rec.order, rec.goodsId, rec.time]) });
+      localStorage.setItem('pdd-evaluation-helper:reports:v1', JSON.stringify(data));
+      [...document.querySelectorAll('.evaluation_search_btn')].find(el => el.innerText === '2星')
+        .addEventListener('click', () => { document.querySelector('#query').disabled = true; });
+      window.renderFixture();
+    });
+    assert.equal((await run(page, { n: 2 })).code, 'QUERY_DISABLED');
+    const s = await state(page);
+    assert.equal(s.batch.summary.reported, 1);
+    assert.equal(s.batch.reconciled.length, 1);
+    assert.deepEqual([s.quota.confirmed, s.quota.uncertain], [1, 1]);
+    assert.equal(s.submissions.length, 0);
+  });
+  test('旧2星恢复后新增举报从1星开始，恢复1条目标2只新增1条', async page => {
+    await page.evaluate(() => { window.sim.records[0].star = 2; });
+    await seedUnknown(page);
+    const result = await run(page, { n: 2 });
+    assert.equal(result.reported, 2, result.message);
+    const s = await state(page);
+    assert.deepEqual(s.queries.map(entry => entry.star), [1, 2, 1]);
+    assert.ok(s.queries.every(entry => entry.submitted === 0));
+    assert.equal(s.submissions.length, 1);
+    assert.equal(s.submissions[0].star, 1);
+    assert.equal(s.quota.confirmed, 2);
+  });
+  test('旧历史核验查询无完成证据时停止，原未知历史不改写且零提交', async page => {
+    await seedUnknown(page);
+    const before = await page.evaluate(() => localStorage.getItem('pdd-evaluation-helper:reports:v1'));
+    await page.evaluate(() => {
+      document.querySelector('#query').addEventListener('click', event => event.stopImmediatePropagation(), true);
+    });
+    assert.equal((await run(page)).code, 'TIMEOUT');
+    const s = await state(page);
+    assert.equal(s.submissions.length, 0);
+    assert.equal(s.quota.uncertain, 1);
+    assert.equal(await page.evaluate(() => localStorage.getItem('pdd-evaluation-helper:reports:v1')), before);
+    assert.ok(s.filterClicks.includes('1星'));
+  });
+  test('核验恢复已经达到目标1时查询1星后零新增提交', async page => {
     await seedUnknown(page);
     const result = await run(page);
     assert.equal(result.reported, 1);
     const s = await state(page);
     assert.equal(s.submissions.length, 0);
-    assert.equal(s.queries.length, 0);
+    assert.equal(s.queries.length, 1);
     assert.equal(s.batch.stopReason, 'target_reached');
   });
-  test('日额度已占30条时仍可核验，零新增提交且不增加占额', async page => {
+  test('日额度已占30条时仍可核验，查询1星后零新增提交且不增加占额', async page => {
     await seedUnknown(page);
     await page.evaluate(() => {
       const data = window.PDDEvaluationHelper.readReportJournal();
@@ -131,7 +229,7 @@ async function main() {
     assert.equal(s.quota.confirmed, 30);
     assert.equal(s.quota.uncertain, 0);
     assert.equal(s.submissions.length, 0);
-    assert.equal(s.queries.length, 0);
+    assert.equal(s.queries.length, 1);
   });
   test('历史日期的核验成功不计入今日目标，当前目标继续处理', async page => {
     await seedUnknown(page, { day: '2026-10-01' });
@@ -150,6 +248,8 @@ async function main() {
     assert.equal(s.submissions.length, 1);
     assert.equal(s.quota.confirmed, 2);
     assert.equal(s.batch.records[0].goodsId, otherGoods);
+    assert.deepEqual(s.goodsEvents, ['', otherGoods]);
+    assert.deepEqual(s.queries.map(entry => entry.submitted), [0, 0]);
   });
   test('部分未知恢复、另一条仍未知时保留已确认计数并阻止新提交', async page => {
     await seedUnknown(page);
@@ -164,7 +264,7 @@ async function main() {
     const s = await state(page);
     assert.deepEqual([s.quota.confirmed, s.quota.uncertain], [1, 1]);
     assert.equal(s.batch.summary.reported, 1);
-    assert.equal(s.queries.length, 0);
+    assert.equal(s.queries.length, 1);
     assert.equal(s.submissions.length, 0);
   });
   test('重复身份的记录即使有受理文字也不能恢复', async page => {
@@ -178,7 +278,7 @@ async function main() {
     assert.equal(s.quota.uncertain, 1);
     assert.equal(s.journal.attempts[0].submissionDiagnostics.rowError.code, 'DUPLICATE_RECORD');
   });
-  test('恢复台账持久化失败时仍不查询不提交', async page => {
+  test('恢复台账持久化失败时查询1星后仍不提交', async page => {
     await seedUnknown(page);
     await page.evaluate(() => {
       const original = Storage.prototype.setItem;
@@ -190,12 +290,12 @@ async function main() {
     assert.equal((await run(page)).code, 'STORAGE_UNAVAILABLE');
     const s = await state(page);
     assert.equal(s.quota.uncertain, 1);
-    assert.equal(s.queries.length, 0);
+    assert.equal(s.queries.length, 1);
     assert.equal(s.submissions.length, 0);
   });
   for (const invalid of ['not-visible', 'different-time', 'different-body', 'different-star',
     'different-report-text', 'different-reason', 'still-link', 'outside-status']) {
-    test(`旧未知${invalid}不能自动核验，零查询零提交`, async page => {
+    test(`旧未知${invalid}不能自动核验，查询1星后零提交`, async page => {
       await seedUnknown(page, invalid === 'different-report-text' ? { reportText: '其他文案' }
         : invalid === 'different-reason' ? { reason: '其他原因' } : {});
       await page.evaluate(invalid => {
@@ -214,7 +314,7 @@ async function main() {
       assert.equal((await run(page)).code, 'UNRESOLVED_REPORT_HISTORY');
       const s = await state(page);
       assert.equal(s.submissions.length, 0);
-      assert.equal(s.queries.length, 0);
+      assert.equal(s.queries.length, 1);
       assert.equal(s.quota.uncertain, 1);
     });
   }
