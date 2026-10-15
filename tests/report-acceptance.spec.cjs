@@ -94,20 +94,20 @@ async function main() {
     assert.equal(s.batch.summary.skipped, 1);
     assert.notEqual(s.submissions[0].order, s.records[0].order);
   });
-  test('核验恢复1条计入目标2，仅新增1次提交且保留旧TIMEOUT历史', async page => {
+  test('历史恢复不计本次目标，新增1条后结果不足正常结束并保留旧TIMEOUT历史', async page => {
     await seedUnknown(page);
     const result = await run(page, { n: 2 });
-    assert.equal(result.reported, 2, result.message);
+    assert.equal(result.reported, 1, result.message);
     const s = await state(page);
     assert.equal(s.submissions.length, 1);
     assert.equal(s.batch.reconciled.length, 1);
-    assert.equal(s.batch.records[0].recovered, true);
+    assert.equal(s.batch.records[0].status, 'skipped_previously_reported');
     assert.equal(s.journal.attempts[0].history.at(-1).evidence, 'TIMEOUT');
     assert.equal(s.journal.attempts[0].verification.source, 'current_record_status');
     assert.equal(s.stats.confirmed, 2);
     assert.equal(s.stats.uncertain, 0);
   });
-  test('带追评时间的旧记录可核验恢复，目标2仍只新增1条', async page => {
+  test('带追评时间旧记录恢复只修正历史，目标2实际新增1条', async page => {
     await page.evaluate(() => {
       const originalRender = window.renderFixture;
       window.renderFixture = () => {
@@ -122,10 +122,10 @@ async function main() {
     });
     await seedUnknown(page);
     const result = await run(page, { n: 2 });
-    assert.equal(result.reported, 2, result.message);
+    assert.equal(result.reported, 1, result.message);
     const s = await state(page);
     assert.equal(s.batch.reconciled.length, 1);
-    assert.equal(s.batch.records[0].recovered, true);
+    assert.equal(s.batch.records[0].status, 'skipped_previously_reported');
     assert.equal(s.submissions.length, 1);
     assert.notEqual(s.submissions[0].order, s.records[0].order);
     assert.equal(s.journal.attempts[0].id, 'synthetic-unknown');
@@ -133,47 +133,33 @@ async function main() {
       JSON.stringify([s.records[0].order, s.records[0].goodsId, s.records[0].time]));
     assert.equal(s.journal.attempts[0].history.at(-1).evidence, 'TIMEOUT');
     assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [2, 0]);
-    const submittedRecord = s.batch.records.find(record => !record.recovered);
+    const submittedRecord = s.batch.records.find(record => record.status === 'confirmed');
     assert.equal(submittedRecord.timeDiagnostics.ignoredCount, 1);
   });
-  test('旧1星记录先查询1星再核验，不依赖默认结果页', async page => {
+  test('旧1星记录先正常查询再核验，随后新增1条满足本次目标', async page => {
     await seedUnknown(page);
     await page.evaluate(() => { window.sim.filterStar = 4; window.renderFixture(); });
     const result = await run(page, { n: 1 });
     assert.equal(result.reported, 1, result.message);
     const s = await state(page);
     assert.equal(s.queries[0].star, 1);
-    assert.equal(s.submissions.length, 0);
+    assert.equal(s.submissions.length, 1);
     assert.equal(s.batch.reconciled.length, 1);
     assert.ok(s.filterClicks.includes('1星'));
   });
   for (const star of [2, 3]) {
-    test(`旧${star}星记录按1星起始查询到对应星级后恢复，核验前零提交`, async page => {
+    test(`旧${star}星记录只在正常遍历遇到时恢复，不预先追查且不计本次成功`, async page => {
       await page.evaluate(star => { window.sim.records[0].star = star; }, star);
       await seedUnknown(page);
-      assert.equal((await run(page)).reported, 1);
+      assert.equal((await run(page, { n: 3 })).reported, 1);
       const s = await state(page);
-      assert.deepEqual(s.queries.map(entry => entry.star), Array.from({ length: star }, (_, i) => i + 1));
-      assert.ok(s.queries.every(entry => entry.submitted === 0));
-      assert.equal(s.submissions.length, 0);
+      assert.deepEqual(s.queries.map(entry => entry.star), [1, 2, 3]);
+      assert.ok(s.queries.slice(1).every(entry => entry.submitted === 1));
+      assert.equal(s.submissions.length, 1);
       assert.equal(s.stats.uncertain, 0);
     });
   }
-  test('旧1星订单在第二页时查询并翻页核验，零重复举报', async page => {
-    await seedUnknown(page);
-    await page.evaluate(() => {
-      window.sim.records.reverse();
-      window.sim.pageSize = 1;
-      window.renderFixture();
-    });
-    const result = await run(page);
-    assert.equal(result.reported, 1, result.message);
-    const s = await state(page);
-    assert.deepEqual(s.queries.map(entry => entry.star), [1]);
-    assert.ok(s.visits.some(entry => entry.star === 1 && entry.page === 2));
-    assert.equal(s.submissions.length, 0);
-  });
-  test('第二页恢复后返回第一页继续目标2，仅新增1条', async page => {
+  test('旧1星订单在第二页时随正常遍历核验，新增举报与历史分开', async page => {
     await seedUnknown(page);
     await page.evaluate(() => {
       window.sim.records.reverse();
@@ -181,13 +167,27 @@ async function main() {
       window.renderFixture();
     });
     const result = await run(page, { n: 2 });
-    assert.equal(result.reported, 2, result.message);
+    assert.equal(result.reported, 1, result.message);
+    const s = await state(page);
+    assert.deepEqual(s.queries.map(entry => entry.star), [1, 2, 3]);
+    assert.ok(s.visits.some(entry => entry.star === 1 && entry.page === 2));
+    assert.equal(s.submissions.length, 1);
+  });
+  test('正常翻页恢复只修正历史，目标2不足时实际新增1条', async page => {
+    await seedUnknown(page);
+    await page.evaluate(() => {
+      window.sim.records.reverse();
+      window.sim.pageSize = 1;
+      window.renderFixture();
+    });
+    const result = await run(page, { n: 2 });
+    assert.equal(result.reported, 1, result.message);
     const s = await state(page);
     assert.equal(s.submissions.length, 1);
     assert.equal(s.stats.confirmed, 2);
     assert.equal(s.stats.uncertain, 0);
   });
-  test('1星恢复后2星查询被禁用，已恢复计数和历史仍保留且零提交', async page => {
+  test('1星历史恢复后2星查询被禁用，历史保留且本次成功仍为0', async page => {
     await seedUnknown(page);
     await page.evaluate(() => {
       const data = window.PDDEvaluationHelper.readReportJournal();
@@ -203,19 +203,20 @@ async function main() {
     });
     assert.equal((await run(page, { n: 2 })).code, 'QUERY_DISABLED');
     const s = await state(page);
-    assert.equal(s.batch.summary.reported, 1);
+    assert.equal(s.batch.summary.reported, 0);
     assert.equal(s.batch.reconciled.length, 1);
     assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [1, 1]);
     assert.equal(s.submissions.length, 0);
   });
-  test('旧2星恢复后新增举报从1星开始，恢复1条目标2只新增1条', async page => {
+  test('旧2星历史不提前查询；1星先新增，再顺序遇到2星时修正历史', async page => {
     await page.evaluate(() => { window.sim.records[0].star = 2; });
     await seedUnknown(page);
     const result = await run(page, { n: 2 });
-    assert.equal(result.reported, 2, result.message);
+    assert.equal(result.reported, 1, result.message);
     const s = await state(page);
-    assert.deepEqual(s.queries.map(entry => entry.star), [1, 2, 1]);
-    assert.ok(s.queries.every(entry => entry.submitted === 0));
+    assert.deepEqual(s.queries.map(entry => entry.star), [1, 2, 3]);
+    assert.equal(s.queries[0].submitted, 0);
+    assert.ok(s.queries.slice(1).every(entry => entry.submitted === 1));
     assert.equal(s.submissions.length, 1);
     assert.equal(s.submissions[0].star, 1);
     assert.equal(s.stats.confirmed, 2);
@@ -233,16 +234,16 @@ async function main() {
     assert.equal(await page.evaluate(() => localStorage.getItem('pdd-evaluation-helper:reports:v1')), before);
     assert.ok(s.filterClicks.includes('1星'));
   });
-  test('核验恢复已经达到目标1时查询1星后零新增提交', async page => {
+  test('历史恢复不抵扣目标1，继续新增1次提交', async page => {
     await seedUnknown(page);
     const result = await run(page);
     assert.equal(result.reported, 1);
     const s = await state(page);
-    assert.equal(s.submissions.length, 0);
+    assert.equal(s.submissions.length, 1);
     assert.equal(s.queries.length, 1);
     assert.equal(s.batch.stopReason, 'target_reached');
   });
-  test('已有29条确认仍可恢复1条并新增1条完成目标2', async page => {
+  test('已有29条确认不影响本次目标，恢复1条和新增1条分别记录', async page => {
     await seedUnknown(page);
     await page.evaluate(() => {
       const data = window.PDDEvaluationHelper.readReportJournal();
@@ -253,34 +254,35 @@ async function main() {
       }
       localStorage.setItem('pdd-evaluation-helper:reports:v1', JSON.stringify(data));
     });
-    assert.equal((await run(page, { n: 2 })).reported, 2);
+    assert.equal((await run(page, { n: 2 })).reported, 1);
     const s = await state(page);
     assert.equal(s.stats.confirmed, 31);
     assert.equal(s.stats.uncertain, 0);
     assert.equal(s.submissions.length, 1);
-    assert.equal(s.queries.length, 1);
+    assert.equal(s.queries.length, 3);
   });
-  test('历史日期未知在本次确认成功可计目标，保留原日期且不重发', async page => {
+  test('历史日期未知恢复保留原日期，本次目标只计新增且不重发', async page => {
     await seedUnknown(page, { day: '2026-10-01' });
     assert.equal((await run(page)).reported, 1);
     const s = await state(page);
-    assert.equal(s.submissions.length, 0);
-    assert.equal(s.stats.confirmed, 1);
+    assert.equal(s.submissions.length, 1);
+    assert.equal(s.stats.confirmed, 2);
     assert.equal(s.batch.reconciled[0].day, '2026-10-01');
-    assert.equal(s.batch.records[0].recovered, true);
+    assert.equal(s.batch.records[0].status, 'skipped_previously_reported');
   });
-  test('指定其他商品时核验旧未知但不计入商品目标', async page => {
+  test('指定其他商品时不查询旧商品，历史待核验不影响本次目标', async page => {
     await seedUnknown(page);
     const otherGoods = await page.evaluate(() => window.sim.records[1].goodsId);
     assert.equal((await run(page, { n: 1, goodsId: otherGoods })).reported, 1);
     const s = await state(page);
     assert.equal(s.submissions.length, 1);
-    assert.equal(s.stats.confirmed, 2);
+    assert.equal(s.stats.confirmed, 1);
+    assert.equal(s.stats.uncertain, 1);
     assert.equal(s.batch.records[0].goodsId, otherGoods);
-    assert.deepEqual(s.goodsEvents, ['', otherGoods]);
-    assert.deepEqual(s.queries.map(entry => entry.submitted), [0, 0]);
+    assert.deepEqual(s.goodsEvents, [otherGoods]);
+    assert.deepEqual(s.queries.map(entry => entry.submitted), [0]);
   });
-  test('部分未知恢复、另一条仍未知时保留已确认计数并阻止新提交', async page => {
+  test('部分历史恢复、另一条不可见未知时继续新提交，本次计数独立', async page => {
     await seedUnknown(page);
     await page.evaluate(() => {
       const data = window.PDDEvaluationHelper.readReportJournal();
@@ -289,12 +291,12 @@ async function main() {
         key: JSON.stringify([rec.order, rec.goodsId, rec.time]) });
       localStorage.setItem('pdd-evaluation-helper:reports:v1', JSON.stringify(data));
     });
-    assert.equal((await run(page, { n: 2 })).code, 'UNRESOLVED_REPORT_HISTORY');
+    assert.equal((await run(page, { n: 2 })).reported, 1);
     const s = await state(page);
-    assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [1, 1]);
+    assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [2, 1]);
     assert.equal(s.batch.summary.reported, 1);
-    assert.equal(s.queries.length, 1);
-    assert.equal(s.submissions.length, 0);
+    assert.equal(s.queries.length, 3);
+    assert.equal(s.submissions.length, 1);
   });
   test('重复身份的记录即使有受理文字也不能恢复', async page => {
     await seedUnknown(page);
@@ -302,10 +304,10 @@ async function main() {
       window.sim.records[1] = { ...window.sim.records[0] };
       window.renderFixture();
     });
-    assert.equal((await run(page)).code, 'UNRESOLVED_REPORT_HISTORY');
+    assert.equal((await run(page)).code, 'DUPLICATE_RECORD');
     const s = await state(page);
     assert.equal(s.stats.uncertain, 1);
-    assert.equal(s.journal.attempts[0].submissionDiagnostics.rowError.code, 'DUPLICATE_RECORD');
+    assert.equal(s.batch.error.code, 'DUPLICATE_RECORD');
   });
   test('恢复台账持久化失败时查询1星后仍不提交', async page => {
     await seedUnknown(page);
@@ -324,7 +326,7 @@ async function main() {
   });
   for (const invalid of ['not-visible', 'different-time', 'different-body', 'different-star',
     'different-report-text', 'different-reason', 'still-link', 'outside-status']) {
-    test(`旧未知${invalid}不能自动核验，查询1星后零提交`, async page => {
+    test(`旧未知${invalid}不能自动核验，只处理其他评价且不重发旧身份`, async page => {
       await seedUnknown(page, invalid === 'different-report-text' ? { reportText: '其他文案' }
         : invalid === 'different-reason' ? { reason: '其他原因' } : {});
       await page.evaluate(invalid => {
@@ -340,9 +342,11 @@ async function main() {
         }
         window.renderFixture();
       }, invalid);
-      assert.equal((await run(page)).code, 'UNRESOLVED_REPORT_HISTORY');
+      const oldOrder = (await state(page)).journal.attempts[0].order;
+      assert.equal((await run(page)).reported, 1);
       const s = await state(page);
-      assert.equal(s.submissions.length, 0);
+      assert.equal(s.submissions.length, 1);
+      assert.notEqual(s.submissions[0].order, oldOrder);
       assert.equal(s.queries.length, 1);
       assert.equal(s.stats.uncertain, 1);
     });

@@ -359,7 +359,7 @@ async function main() {
     assert.equal(s.submissions.length, 0);
     assert.equal(s.stats.uncertain, 0);
   });
-  test('无成功提示关闭弹框仍未知；不计成功，后续批阻止重发', 'unknown', async page => {
+  test('无成功提示关闭弹框仍未知；后续批跳过旧条，只对另一记录提交', 'unknown', async page => {
     const result = await run(page, { n: 1 });
     assert.equal(result.code, 'REPORT_SUBMITTED_UNVERIFIED');
     let s = await state(page);
@@ -367,19 +367,22 @@ async function main() {
     assert.equal(s.batch.summary.reported, 0);
     assert.equal(s.journal.attempts[0].status, 'submitted_unverified');
     assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [0, 1]);
-    assert.equal((await run(page)).code, 'UNRESOLVED_REPORT_HISTORY');
+    assert.equal((await run(page)).code, 'REPORT_SUBMITTED_UNVERIFIED');
     s = await state(page);
-    assert.equal(s.submissions.length, 1);
+    assert.equal(s.submissions.length, 2);
+    assert.equal(new Set(s.submissions.map(entry => entry.order)).size, 2);
+    assert.equal(s.batch.summary.skippedPending, 1);
   });
   test('旧成功提示不算本次成功', 'stale-toast', async page => {
     assert.equal((await run(page, { n: 1 })).code, 'REPORT_SUBMITTED_UNVERIFIED');
     assert.equal((await state(page)).stats.confirmed, 0);
     assert.equal((await state(page)).submissions.length, 1);
   });
-  test('前日未知提交仍需核验，不能自动在新日重发', 'normal', async page => {
+  test('前日不可见未知不阻止本次新记录，旧条不重发', 'normal', async page => {
     await seed(page, 1, 'submitted_unverified', '2026-10-01');
-    assert.equal((await run(page)).code, 'UNRESOLVED_REPORT_HISTORY');
-    assert.equal((await state(page)).submissions.length, 0);
+    assert.equal((await run(page, { n: 1 })).reported, 1);
+    assert.equal((await state(page)).submissions.length, 1);
+    assert.equal((await state(page)).stats.uncertain, 1);
   });
   test('人工确认成功增加累计成功数并保留核验历史', 'unknown', async page => {
     await run(page, { n: 1 });

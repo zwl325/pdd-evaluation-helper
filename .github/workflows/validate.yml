@@ -25,6 +25,7 @@ jobs:
           node --check tests/report-workflow.spec.cjs
           node --check tests/record-time.spec.cjs
           node --check tests/report-counter-templates.spec.cjs
+          node --check tests/report-batch-reset.spec.cjs
           node --check tests/report-acceptance.spec.cjs
           node --check tests/pagination.spec.cjs
           node --check tests/metadata.spec.cjs

@@ -153,23 +153,23 @@ for (const mode of ['reply', 'report']) {
     });
   }
 }
-test('没有任何页码证据仍能先查询1星再核验，目标1零提交', 'report', async page => {
+test('没有页码可修正当前旧历史，但本次目标仍为0且停止零提交', 'report', async page => {
   await seedUnknown(page);
   await page.evaluate(() => { window.sim.paginationVariant = 'none'; window.renderFixture(); });
   const result = await run(page, 'report');
-  assert.equal(result.reported, 1, result.message);
+  assert.equal(result.code, 'PAGE_UNREADABLE', result.message);
   const s = await state(page, 'report');
   assert.equal(s.queries.length, 1);
   assert.equal(s.submissions.length, 0);
   assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [1, 0]);
 });
-test('旧未知恢复1条后用status继续目标2，仅新增1条', 'report', async page => {
+test('旧未知恢复只修正历史，用status继续本次目标2新增2条', 'report', async page => {
   await seedUnknown(page);
   const result = await run(page, 'report', { n: 2 });
   assert.equal(result.reported, 2, result.message);
   const s = await state(page, 'report');
-  assert.equal(s.submissions.length, 1);
-  assert.equal(s.stats.confirmed, 2);
+  assert.equal(s.submissions.length, 2);
+  assert.equal(s.stats.confirmed, 3);
   assert.equal(s.stats.uncertain, 0);
 });
 test('查询后的核验不依赖页码仍等待加载完成，随后恢复而不新增提交', 'report', async page => {
@@ -179,7 +179,7 @@ test('查询后的核验不依赖页码仍等待加载完成，随后恢复而�
     window.sim.delay = 450;
   });
   const result = await run(page, 'report');
-  assert.equal(result.reported, 1, result.message);
+  assert.equal(result.code, 'PAGE_UNREADABLE', result.message);
   const s = await state(page, 'report');
   assert.equal(s.queries.length, 1);
   assert.equal(s.submissions.length, 0);
@@ -190,24 +190,24 @@ test('核验不依赖页码但短暂受理状态仍不能恢复', 'report', asyn
     window.sim.paginationVariant = 'none'; window.renderFixture();
     setTimeout(() => { window.sim.records[0].acceptedText = ''; window.renderFixture(); }, 120);
   });
-  assert.equal((await run(page, 'report')).code, 'UNRESOLVED_REPORT_HISTORY');
+  assert.equal((await run(page, 'report')).code, 'PAGE_UNREADABLE');
   const s = await state(page, 'report');
   assert.equal(s.stats.uncertain, 1);
   assert.equal(s.queries.length, 1);
   assert.equal(s.submissions.length, 0);
 });
-test('恢复后仍无页码且目标2时保留恢复1条，停止而不提交', 'report', async page => {
+test('恢复历史后仍无页码且目标2时本次计数为0，历史确认保留', 'report', async page => {
   await seedUnknown(page);
   await page.evaluate(() => { window.sim.paginationVariant = 'none'; window.renderFixture(); });
   assert.equal((await run(page, 'report', { n: 2 })).code, 'PAGE_UNREADABLE');
   const s = await state(page, 'report');
-  assert.equal(s.batch.summary.reported, 1);
+  assert.equal(s.batch.summary.reported, 0);
   assert.equal(s.stats.confirmed, 1);
   assert.equal(s.stats.uncertain, 0);
   assert.equal(s.submissions.length, 0);
   assert.equal(s.batch.error.details.stage, 'pagination');
 });
-test('不可见旧未知保存查询后候选身份，无法确认分页仍停止', 'report', async page => {
+test('不可见旧未知不追查或覆盖原诊断，分页不可确认仍停止', 'report', async page => {
   await seedUnknown(page);
   await page.evaluate(() => {
     const journal = window.PDDEvaluationHelper.readReportJournal();
@@ -220,11 +220,7 @@ test('不可见旧未知保存查询后候选身份，无法确认分页仍停�
   assert.equal((await run(page, 'report')).code, 'PAGE_UNREADABLE');
   const s = await state(page, 'report');
   const d = s.journal.attempts[0].submissionDiagnostics;
-  assert.equal(d.stage, 'reconcile');
-  assert.equal(d.rowFound, false);
-  assert.ok(d.list.visibleRecordCount > 0);
-  assert.ok(d.list.identities.some(identity => identity.order === s.records[0].order));
-  assert.ok(Date.parse(d.observedAt) >= Date.parse(s.batch.startedAt));
+  assert.deepEqual(d, { stage: 'old-diagnostic', observedAt: '2026-10-01T00:00:00Z' });
   assert.equal(s.queries.length, 1);
   assert.equal(s.submissions.length, 0);
   assert.equal(s.stats.uncertain, 1);

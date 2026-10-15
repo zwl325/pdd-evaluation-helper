@@ -119,12 +119,12 @@ test('特殊模式待核验有文字评价恢复时保留原文且不重发', 'r
   await page.evaluate(text => window.PDDEvaluationHelper.saveTemplate('report', text), reportCopy);
   assert.equal((await run(page, { n: 1 }, true)).reported, 1);
   const s = await state(page);
-  assert.equal(s.submissions.length, 1);
-  assert.equal(s.batch.records[0].recovered, true);
+  assert.equal(s.submissions.length, 2);
+  assert.equal(s.batch.records[0].status, 'skipped_previously_reported');
   assert.equal(s.stats.uncertain, 0);
   assert.notEqual(s.journal.attempts[0].reportText, reportCopy, '旧尝试保留实际旧文案，编辑文案不阻止核验');
 });
-test('特殊模式遇到其他星级未知历史时不越界查询2星或新增', 'report', async page => {
+test('特殊模式遇到其他星级未知历史时不越界查询且可新增1星', 'report', async page => {
   await page.evaluate(() => {
     const h = window.PDDEvaluationHelper;
     const rec = window.sim.records.find(rec => rec.star === 2);
@@ -134,10 +134,11 @@ test('特殊模式遇到其他星级未知历史时不越界查询2星或新增'
       day, status: 'submitted_unverified', reportText: h.readTemplates().reportText, history: [],
     }] }));
   });
-  assert.equal((await run(page, { n: 1 }, true)).code, 'UNRESOLVED_REPORT_HISTORY');
+  assert.equal((await run(page, { n: 1 }, true)).reported, 1);
   const s = await state(page);
   assert.deepEqual(s.queries.map(q => q.star), [1]);
-  assert.equal(s.submissions.length, 0);
+  assert.equal(s.submissions.length, 1);
+  assert.equal(s.stats.uncertain, 1);
 });
 for (const kind of ['reply', 'report']) {
   test(`${kind}编辑保存后完整提交并记入台账`, kind, async page => {

@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-15.3
+// @name         PDD评价筛选助手 v2026-10-15.4
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-15.3
+// @version      2026-10-15.4
 // @description  PDD自动筛选回复与差评举报，支持成功计数、一星正文不限举报、可编辑文案、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-15.3',
+    version: '2026-10-15.4',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -1212,6 +1212,25 @@
         : data.modalCount === 0 && freshSuccess ? 'fresh_report_success' : '';
       return data;
     }
+    function diagnostics(rec, reading) {
+      const data = { ...reading, observedAt: new Date().toISOString() };
+      try {
+        const group = ReviewDOM.find(rec);
+        if (group) {
+          const fragment = element => ({ text: ReviewDOM.text(element).slice(0, 1500),
+            outerHTML: element.outerHTML.slice(0, 16000) });
+          data.rowDOM = {
+            outerHTML: group.outerHTML.slice(0, 24000),
+            headers: ReviewDOM.all('.evaluation-item-header', group).filter(DOM.visible).slice(0, 3).map(fragment),
+            reportRegions: ReviewDOM.all('[data-tracking-click-viewid="report"]', group)
+              .filter(DOM.visible).slice(0, 3).map(fragment),
+          };
+        }
+      } catch (error) {
+        data.diagnosticError = { code: error.code || error.name, message: error.message };
+      }
+      return data;
+    }
     function reported(group) {
       const region = group.querySelector('[data-tracking-click-viewid="report"]');
       return acceptedStatus(group).accepted ||
@@ -1224,7 +1243,7 @@
         !element.querySelector('input, textarea'));
     }
     return Object.freeze({ eligible, toggle, selectStar, stars, current, modal, waitModal, reason,
-      reasonSelected, reported, acceptedStatus, submissionState, successMessages });
+      reasonSelected, reported, acceptedStatus, submissionState, diagnostics, successMessages });
   })();
 
   const ReportLedger = (() => {
@@ -1287,7 +1306,9 @@
     function saveBatch(batch) {
       batch.summary = { checked: batch.records.length,
         reported: batch.records.filter(rec => rec.status === 'confirmed').length,
-        skipped: batch.records.filter(rec => rec.status?.startsWith('skipped_')).length };
+        skipped: batch.records.filter(rec => rec.status?.startsWith('skipped_')).length,
+        pending: batch.records.filter(rec => ['submitting', 'submitted_unverified'].includes(rec.status)).length,
+        skippedPending: batch.records.filter(rec => rec.status === 'skipped_pending_history').length };
       Ledger.write(sessionStorage, Config.reportBatchKey, batch);
     }
     const lastBatch = () => Ledger.read(sessionStorage, Config.reportBatchKey, null);
@@ -1322,13 +1343,17 @@
         return { ...entry };
       });
     }
-    async function reconcile(options) {
-      const uncertain = journal().attempts.filter(entry =>
+    async function reconcile(options, observed = new Set()) {
+      let uncertain = journal().attempts.filter(entry => !observed.has(entry.id) &&
         ['submitting', 'submitted_unverified'].includes(entry.status));
       if (!uncertain.length) return [];
       await Wait.until(() => ReviewDOM.table(true),
         { ...options, timeoutMs: Config.resultTimeoutMs, description: '等待核验待确认举报的当前列表' });
       await Results.currentTableStable(options);
+      // 只核验本次正常遍历中实际遇到的旧记录，不扩展商品／星级或追查不可见历史。
+      const visibleKeys = new Set(ReviewDOM.groups().map(group => ReviewDOM.record(group, '').key));
+      uncertain = uncertain.filter(entry => visibleKeys.has(entry.key));
+      if (!uncertain.length) return [];
       let signature;
       const observations = await Wait.until(() => {
         if (ReviewDOM.busy()) { signature = undefined; return false; }
@@ -1346,7 +1371,8 @@
         if (!entry || !['submitting', 'submitted_unverified'].includes(entry.status)) {
           throw new HelperError('REPORT_JOURNAL_CHANGED', '核验期间举报台账变化，已停止。');
         }
-        entry.submissionDiagnostics = { ...reading, stage: 'reconcile', observedAt: new Date().toISOString() };
+        // 原提交现场是诊断依据，后续只读核验另存，不能覆盖原超时及等待错误。
+        entry.reconciliationDiagnostics = ReportDOM.diagnostics(entry, { ...reading, stage: 'reconcile' });
         let validText = false;
         try { Templates.validate('report', entry.reportText); validText = true; } catch { /* 未知文案不自动恢复。 */ }
         if (reading.evidence !== 'record_report_accepted' || !validText ||
@@ -1359,6 +1385,7 @@
         recovered.push({ ...entry, attemptId: entry.id, content: entry.content ?? Config.reportContent, recovered: true });
       }
       Ledger.write(localStorage, Config.reportJournalKey, data);
+      for (const entry of uncertain) observed.add(entry.id);
       return recovered;
     }
     return Object.freeze({ day, journal, stats, previous, reserve, update, saveBatch, lastBatch,
@@ -1441,13 +1468,13 @@
         await Results.stable(options);
       } catch (error) {
         if (submitted && rec.status !== 'confirmed') {
-          rec.submissionDiagnostics = { ...(lastReading || ReportDOM.submissionState(rec, freshSuccess)),
-            observedAt: new Date().toISOString(), waitError: { code: error.code || error.name,
-              message: error.message } };
+          rec.submissionDiagnostics = ReportDOM.diagnostics(rec,
+            { ...(lastReading || ReportDOM.submissionState(rec, freshSuccess)),
+              waitError: { code: error.code || error.name, message: error.message } });
           ReportLedger.update(rec, 'submitted_unverified', error.code || error.message);
           ReportLedger.saveBatch(batch);
           throw Object.assign(new HelperError('REPORT_SUBMITTED_UNVERIFIED',
-            '已发出一次举报但结果不明；未计成功，保留待核验记录并停止，请核验台账。'),
+            '本次已发出一次举报但结果不明；未计成功，保留待核验记录并停止。再次运行将跳过该条并处理其他评价。'),
           { details: rec.submissionDiagnostics });
         }
         throw error;
@@ -1464,8 +1491,9 @@
       const target = p.n ?? Infinity;
       const batch = { id: crypto.randomUUID(), version: Config.version, taskMode: 'report',
         startedAt: new Date().toISOString(), day: ReportLedger.day(), shop: '',
-        params: p, templates, strategy, target: p.n, star: 1, phase: 'reconciling', records: [] };
+        params: p, templates, strategy, target: p.n, star: 1, phase: 'querying', records: [], reconciled: [] };
       ReportLedger.saveBatch(batch);
+      Actions.update({ tone: 'info', message: `已开始新批次：本次成功举报0/${p.n ?? '全部'}条，检查0条，跳过0条。` });
       const originalGuard = options.guard;
       let filterSignature;
       options.guard = () => {
@@ -1476,8 +1504,13 @@
       };
       try {
         let pagePrepared = false;
-        let queriedStar = null;
-        let queriedGoods = null;
+        ReportLedger.journal(); // 校验持久台账；历史业务状态不作为本批次启动门槛。
+        const observedHistory = new Set();
+        const refreshHistory = async () => {
+          const recovered = await ReportLedger.reconcile(options, observedHistory);
+          batch.reconciled.push(...recovered.map(entry => ({ id: entry.id, day: entry.day, key: entry.key })));
+          ReportLedger.saveBatch(batch); // 历史恢复只更新台账，不增加本次成功数。
+        };
         let turns = 0;
         const turn = async direction => {
           if (++turns > Config.maxPages) throw new HelperError('PAGE_LIMIT', '举报翻页超过保护上限。');
@@ -1496,132 +1529,84 @@
           if (residuals.length) throw new HelperError('RESIDUAL_FILTER', '存在未指定的订单号或关键词，请清空后再举报。');
           pagePrepared = true;
         };
-        const queryStar = async (label, reconciling = false, goodsId = p.goodsId) => {
+        const queryStar = async label => {
           await preparePage();
           options.guard();
           filterSignature = undefined;
-          if (ReviewDOM.goods().value !== goodsId) ReviewDOM.setValue(ReviewDOM.goods(), goodsId);
-          await Wait.until(() => ReviewDOM.goods().value === goodsId, { ...options, description: '核验举报商品ID' });
+          if (ReviewDOM.goods().value !== p.goodsId) ReviewDOM.setValue(ReviewDOM.goods(), p.goodsId);
+          await Wait.until(() => ReviewDOM.goods().value === p.goodsId, { ...options, description: '核验举报商品ID' });
           batch.star = Number(label[0]);
           batch.phase = 'querying';
           ReportLedger.saveBatch(batch);
           await ReportDOM.selectStar(label, options);
           filterSignature = ReviewDOM.filterSignature();
           batch.filters = JSON.parse(filterSignature);
-          Actions.update({ message: reconciling ? `正在查询${label}，核验已有举报；核验完成前不新增提交。`
-            : `正在查询${label}；本次目标成功举报${batch.target ?? '全部'}条。` });
+          Actions.update({ message: `正在查询${label}；本次目标成功举报${batch.target ?? '全部'}条。` });
           const clickQuery = () => {
             const button = ReviewDOM.queryButton();
             if (!DOM.enabled(button)) throw new HelperError('QUERY_DISABLED', '查询按钮不可用。');
             button.click();
           };
-          if (reconciling) await Results.transitionCurrentTable(clickQuery, options);
-          else await Results.transition(clickQuery, options, 1);
-          batch.phase = reconciling ? 'reconciling' : 'reporting';
+          await Results.transitionCurrentTable(clickQuery, options);
+          batch.phase = 'reporting';
           ReportLedger.saveBatch(batch);
-          queriedStar = label;
-          queriedGoods = goodsId;
+          await refreshHistory();
         };
-        const uncertain = ReportLedger.journal().attempts.filter(entry =>
-          ['submitting', 'submitted_unverified'].includes(entry.status));
-        const recovered = [];
-        const saveRecovered = () => {
-          batch.reconciled = recovered.map(entry => ({ id: entry.id, day: entry.day, key: entry.key }));
-          const eligible = recovered.filter(entry =>
-            (!p.goodsId || entry.goodsId === p.goodsId) && ReportDOM.eligible(entry, strategy));
-          batch.records = eligible.slice(0, target).map((entry, index) => ({ ...entry, rank: index + 1 }));
-          ReportLedger.saveBatch(batch);
-        };
-        if (uncertain.length) {
-          const highestUncertainStar = Math.max(...uncertain.map(entry =>
-            [1, 2, 3].includes(entry.star) ? entry.star : 1));
-          // 核验读取已有提交；指定商品以外的未知历史也需核验，临时查询商品不限。
-          // 恢复完成后，新举报查询重新使用用户本次指定的商品。
-          const recoveryGoods = p.goodsId && uncertain.some(entry => entry.goodsId !== p.goodsId) ? '' : p.goodsId;
-          for (const label of starLabels.slice(0, highestUncertainStar)) {
-            await queryStar(label, true, recoveryGoods);
-            while (true) {
-              recovered.push(...await ReportLedger.reconcile(options));
-              saveRecovered();
-              const pending = ReportLedger.journal().attempts.filter(entry =>
-                ['submitting', 'submitted_unverified'].includes(entry.status) && entry.star === Number(label[0]));
-              // 已找到但证据不足不扩大查找；尚未找到的同星级记录才继续翻页核验。
-              if (!pending.length || pending.some(entry => entry.submissionDiagnostics?.rowFound) ||
-                  !ReviewDOM.canTurn(ReviewDOM.page().next)) break;
-              await turn('next');
-            }
-            if (!ReportLedger.journal().attempts.some(entry =>
-              ['submitting', 'submitted_unverified'].includes(entry.status))) break;
-          }
-        }
-        saveRecovered();
-        if (ReportLedger.journal().attempts.some(entry => ['submitting', 'submitted_unverified'].includes(entry.status))) {
-          throw new HelperError('UNRESOLVED_REPORT_HISTORY', '存在待核验举报提交，请先核验本机举报台账。');
-        }
-        if (batch.summary.reported >= target) {
-          batch.stopReason = 'target_reached';
-        } else {
-          await preparePage();
-          const seen = new Set(batch.records.map(rec => rec.key));
-          for (const label of starLabels) {
-            if (batch.summary.reported >= target) break;
+        await preparePage();
+        const seen = new Set();
+        for (const label of starLabels) {
+          if (batch.summary.reported >= target) break;
+          options.guard();
+          await queryStar(label);
+          if (ReviewDOM.page().number !== 1) throw new HelperError('QUERY_PAGE_MISMATCH', '查询未返回第一页，已停止。');
+          while (batch.summary.reported < target) {
             options.guard();
-            if (queriedStar !== label || queriedGoods !== p.goodsId) await queryStar(label);
-            else {
-              while (ReviewDOM.page().number > 1) {
-                if (!await turn('prev')) throw new HelperError('CANNOT_RETURN_FIRST', '核验后无法返回第一页。');
-              }
-              batch.star = Number(label[0]);
-              batch.phase = 'reporting';
-              ReportLedger.saveBatch(batch);
+            await Results.stable(options);
+            await refreshHistory();
+            const current = Results.nextRecord(seen, batch.shop);
+            if (!current) {
+              if (!ReviewDOM.canTurn(ReviewDOM.page().next)) break;
+              if (!ReviewDOM.groups().length) throw new HelperError('INCONSISTENT_EMPTY_PAGE', '举报空页仍可翻页。');
+              await turn('next');
+              continue;
             }
-            while (batch.summary.reported < target) {
-              options.guard();
-              await Results.stable(options);
-              const current = Results.nextRecord(seen, batch.shop);
-              if (!current) {
-                if (!ReviewDOM.canTurn(ReviewDOM.page().next)) break;
-                if (!ReviewDOM.groups().length) throw new HelperError('INCONSISTENT_EMPTY_PAGE', '举报空页仍可翻页。');
-                await turn('next');
-                continue;
-              }
-              const group = ReviewDOM.find(current);
-              if (!group || ReportDOM.stars(group) !== batch.star) {
-                throw new HelperError('REPORT_STAR_MISMATCH', '查询结果星级与当前处理星级不一致。');
-              }
-              if (p.goodsId && current.goodsId !== p.goodsId) {
-                throw new HelperError('GOODS_FILTER_MISMATCH', '举报查询包含其他商品。');
-              }
-              const rec = { ...current, strategy, star: batch.star, rank: batch.records.length + 1, status: 'pending' };
-              seen.add(rec.key);
-              batch.records.push(rec);
-              ReportLedger.saveBatch(batch);
-              Actions.update({ message: `${label}：正在检查第${rec.rank}条；成功举报${batch.summary.reported}/${batch.target ?? '全部'}条。` });
-              const prior = ReportLedger.previous(rec);
-              if (prior && ['submitting', 'submitted_unverified'].includes(prior.status)) {
-                throw new HelperError('UNRESOLVED_REPORT_HISTORY', '该评价存在未知举报，未重复提交。');
-              }
-              if (prior?.status === 'confirmed') rec.status = 'skipped_previously_reported';
-              else if (!ReportDOM.eligible(rec, strategy)) rec.status = 'skipped_non_template';
-              else if (ReportDOM.reported(group)) rec.status = 'skipped_already_reported';
-              else await Reports.submit(rec, batch, options);
-              ReportLedger.saveBatch(batch);
-              Actions.update({ message: `${label}：成功举报${batch.summary.reported}/${batch.target ?? '全部'}条；检查${batch.summary.checked}条，跳过${batch.summary.skipped}条。` });
-              if (rec.status === 'confirmed' && batch.summary.reported < target) {
-                while (ReviewDOM.page().number > 1) {
-                  if (!await turn('prev')) throw new HelperError('CANNOT_RETURN_FIRST', '举报后无法返回第一页。');
-                }
+            const group = ReviewDOM.find(current);
+            if (!group || ReportDOM.stars(group) !== batch.star) {
+              throw new HelperError('REPORT_STAR_MISMATCH', '查询结果星级与当前处理星级不一致。');
+            }
+            if (p.goodsId && current.goodsId !== p.goodsId) {
+              throw new HelperError('GOODS_FILTER_MISMATCH', '举报查询包含其他商品。');
+            }
+            const rec = { ...current, strategy, star: batch.star, rank: batch.records.length + 1, status: 'pending' };
+            seen.add(rec.key);
+            batch.records.push(rec);
+            ReportLedger.saveBatch(batch);
+            Actions.update({ message: `${label}：正在检查第${rec.rank}条；成功举报${batch.summary.reported}/${batch.target ?? '全部'}条。` });
+            const prior = ReportLedger.previous(rec);
+            if (prior && ['submitting', 'submitted_unverified'].includes(prior.status)) {
+              rec.status = 'skipped_pending_history';
+              rec.historyAttemptId = prior.id;
+            } else if (prior?.status === 'confirmed') rec.status = 'skipped_previously_reported';
+            else if (!ReportDOM.eligible(rec, strategy)) rec.status = 'skipped_non_template';
+            else if (ReportDOM.reported(group)) rec.status = 'skipped_already_reported';
+            else await Reports.submit(rec, batch, options);
+            ReportLedger.saveBatch(batch);
+            Actions.update({ message: `${label}：成功举报${batch.summary.reported}/${batch.target ?? '全部'}条；检查${batch.summary.checked}条，跳过${batch.summary.skipped}条。` });
+            if (rec.status === 'confirmed' && batch.summary.reported < target) {
+              while (ReviewDOM.page().number > 1) {
+                if (!await turn('prev')) throw new HelperError('CANNOT_RETURN_FIRST', '举报后无法返回第一页。');
               }
             }
           }
-          batch.stopReason = batch.summary.reported >= target ? 'target_reached' : 'stars_exhausted';
         }
+        batch.stopReason = batch.summary.reported >= target ? 'target_reached' : 'stars_exhausted';
         batch.phase = 'completed';
         batch.completedAt = new Date().toISOString();
         ReportLedger.saveBatch(batch);
         const descriptions = { target_reached: '已达到本次成功举报目标',
           stars_exhausted: `${strategy === 'one-star-all' ? '1星' : '1星、2星、3星'}结果已全部处理，暂无需要处理的评价` };
-        Actions.update({ tone: 'success', message: `举报结束：成功${batch.summary.reported}条，检查${batch.summary.checked}条，跳过${batch.summary.skipped}条。${descriptions[batch.stopReason]}。` });
+        Actions.update({ tone: 'success', message: `举报结束：本次成功${batch.summary.reported}条，检查${batch.summary.checked}条，跳过${batch.summary.skipped}条。${descriptions[batch.stopReason]}。`
+          + (batch.summary.skippedPending ? `其中${batch.summary.skippedPending}条为历史待核验，已跳过且未重复举报。` : '') });
         return { ok: true, ...batch.summary, stats: ReportLedger.stats(), batch };
       } catch (error) {
         batch.phase = 'stopped';
@@ -2010,7 +1995,7 @@
       try {
         const stats = ReportLedger.stats();
         const batch = ReportLedger.lastBatch();
-        let message = `累计确认举报${stats.confirmed}条；待核验${stats.uncertain}条。`;
+        let message = '';
         message += DOM.root() ? batch?.strategy === 'one-star-all'
           ? '\n仅处理1星，正文不限；成功一条计数加1。'
           : '\n一键运行按1星→2星→3星处理；仅匹配无文字评价。'
@@ -2021,13 +2006,16 @@
           const reasons = { target_reached: '成功举报目标已达到',
             stars_exhausted: `${batch.strategy === 'one-star-all' ? '1星' : '1至3星'}结果已全部处理，暂无需要处理的评价` };
           const counts = batch.summary;
-          message += `\n最近批次：${phases[batch.phase] || '未知阶段'}；当前${batch.star}星。`
-            + `\n成功举报${counts.reported}/${batch.target ?? '全部'}条；检查${counts.checked}条；跳过${counts.skipped}条。`;
+          message += `\n本次运行：${phases[batch.phase] || '未知阶段'}；当前${batch.star}星。`
+            + `\n本次成功举报${counts.reported}/${batch.target ?? '全部'}条；检查${counts.checked}条；跳过${counts.skipped}条。`
+            + `\n本次待核验${counts.pending ?? 0}条；跳过历史待核验${counts.skippedPending ?? 0}条。`;
           if (batch.stopReason) message += `\n结束原因：${reasons[batch.stopReason] || batch.stopReason}。`;
           if (batch.error?.message) message += `\n停止原因：${batch.error.message}`;
         } else message += '\n尚无举报批次记录。';
+        message += `\n历史台账：累计确认举报${stats.confirmed}条；待核验${stats.uncertain}条。`
+          + (stats.uncertain ? '\n历史待核验仅跳过对应评价，不阻止新批次处理其他记录。' : '');
         if (reportCheckedAt) message += `\n手动检查：${reportCheckedAt}；状态持续自动更新。`;
-        return { message, tone: stats.uncertain ? 'error' : 'info' };
+        return { message: message.trim(), tone: batch?.error ? 'error' : 'info' };
       } catch (error) {
         return { message: `举报状态读取失败：${error.message}`, tone: 'error' };
       }
@@ -2153,7 +2141,7 @@
               <div class="tools"><button id="report-copy-save" type="button">保存文案</button>
                 <button id="report-copy-reset" type="button">恢复默认</button></div>
               <p id="report-copy-feedback" class="copy-feedback" role="status">保存后用于下次运行。</p></details>
-            <p class="hint">一键运行按1星→2星→3星处理，仅举报正文完全等于“该用户未填写文字评价”的记录。成功一条计数加1；达到数量或全部处理完后结束。提交成功表示平台已接收。</p>
+            <p class="hint">一键运行按1星→2星→3星处理，仅举报正文完全等于“该用户未填写文字评价”的记录。每次运行重新计数，历史待核验只跳过对应评价；达到数量或全部处理完后结束。提交成功表示平台已接收。</p>
           </div>
         </section>`;
       shadow.querySelector('#run-once').addEventListener('click', () => {
