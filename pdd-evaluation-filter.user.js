@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-15.4
+// @name         PDD评价筛选助手 v2026-10-15.5
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-15.4
+// @version      2026-10-15.5
 // @description  PDD自动筛选回复与差评举报，支持成功计数、一星正文不限举报、可编辑文案、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-15.4',
+    version: '2026-10-15.5',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -178,12 +178,13 @@
     // Observer负责DOM变化，轮询补足祖先样式、URL等没有直接mutation的状态。
     // 每次等待都有超时；结束、异常、取消都会清理observer和timer。
     function until(probe, { signal, guard, description, timeoutMs = Config.actionTimeoutMs,
-      stableMs = Config.stableMs }) {
+      stableMs = Config.stableMs, retryCodes = [] }) {
       return new Promise((resolve, reject) => {
         let settled = false;
         let stableSince = null;
         let intervalId;
         let timeoutId;
+        let lastTransientError;
         const observer = new MutationObserver(check);
 
         function finish(error, value) {
@@ -207,6 +208,7 @@
             if (signal?.aborted) return onAbort();
             guard?.();
             const value = probe();
+            lastTransientError = null;
             if (!value) {
               stableSince = null;
               return;
@@ -214,7 +216,9 @@
             stableSince ??= performance.now();
             if (performance.now() - stableSince >= stableMs) finish(null, value);
           } catch (error) {
-            finish(error);
+            if (!retryCodes.includes(error.code)) return finish(error);
+            stableSince = null;
+            lastTransientError = error;
           }
         }
 
@@ -232,7 +236,8 @@
         });
         intervalId = setInterval(check, Config.pollMs);
         timeoutId = setTimeout(() => {
-          finish(new HelperError('TIMEOUT', `${description}超时。请检查页面状态及DOM定位，当前操作不会自动重试点击。`));
+          finish(lastTransientError ||
+            new HelperError('TIMEOUT', `${description}超时。请检查页面状态及DOM定位，当前操作不会自动重试点击。`));
         }, timeoutMs);
         check();
       });
@@ -247,7 +252,12 @@
 
     function notify(next) {
       status = { ...status, ...next };
-      for (const listener of listeners) listener();
+      // 面板属于观察者；展示异常不能中断提交状态机或阻止 finally 释放运行锁。
+      for (const listener of listeners) {
+        try { listener(); } catch (error) {
+          console.warn('[PDD评价筛选助手] 面板刷新失败', error.code || error.name);
+        }
+      }
     }
 
     function subscribe(listener) {
@@ -272,11 +282,11 @@
         },
       };
       active = job;
-      notify({ busy: true, ...(!borrowedJob ? { taskMode: 'reply' } : {}),
-        tone: 'info', message: '正在确认评价页及三个筛选目标…' });
       const results = [];
 
       try {
+        notify({ busy: true, ...(!borrowedJob ? { taskMode: 'reply' } : {}),
+          tone: 'info', message: '正在确认评价页及三个筛选目标…' });
         await Wait.until(() => {
           const container = DOM.root();
           if (!container) return false;
@@ -352,8 +362,8 @@
         },
       };
       active = job;
-      notify({ busy: true, taskMode, tone: 'info', message: '正在启动批次…' });
       try {
+        notify({ busy: true, taskMode, tone: 'info', message: '正在启动批次…' });
         return await execute(job);
       } catch (error) {
         notify({ tone: error.code === 'CANCELLED' ? 'info' : 'error', message: error.message });
@@ -550,9 +560,11 @@
       element.dispatchEvent(new Event('input', { bubbles: true }));
       element.dispatchEvent(new Event('change', { bubbles: true }));
     }
-    function filterSignature() {
+    function filterSignature(optional = false) {
+      const currentForm = form(optional);
+      if (!currentForm) return null; // SPA重挂载期间不把缺失表单误判成用户改动。
       return JSON.stringify({
-        fields: all('input, textarea, select', form()).map(element => ({
+        fields: all('input, textarea, select', currentForm).map(element => ({
           name: element.name || element.id || element.getAttribute('data-testid') || '',
           type: element.type,
           value: element.value,
@@ -599,8 +611,10 @@
     const canTurn = (element) => Boolean(element && DOM.enabled(element) && !/PGT_disabled/.test(element.className));
     function busy() {
       const root = DOM.root();
-      return !root || !table(true) || all(Config.selectors.loading, root).some(DOM.visible) ||
-        /加载中|正在加载/.test(text(table()));
+      const currentTable = root && table(true);
+      if (!root || !form(true) || !currentTable) return true;
+      return root.matches(Config.selectors.loading) || all(Config.selectors.loading, root).some(DOM.visible) ||
+        !groups().length && /^(?:加载中|正在加载)[\s.…。!！]*$/.test(text(currentTable));
     }
     function tableFingerprint() {
       return JSON.stringify({ text: table().innerText, groups: groups().map(group => group.innerText) });
@@ -658,12 +672,16 @@
   })();
 
   const Ledger = (() => {
-    function read(store, key, fallback) {
+    function read(store, key, fallback, invalidCode = 'STORAGE_UNAVAILABLE') {
+      let value;
       try {
-        const value = store.getItem(key);
-        return value ? JSON.parse(value) : fallback;
+        value = store.getItem(key);
       } catch {
         throw new HelperError('STORAGE_UNAVAILABLE', '本机台账无法读取；操作停止。');
+      }
+      try { return value ? JSON.parse(value) : fallback; } catch {
+        throw new HelperError(invalidCode, invalidCode === 'INVALID_TEMPLATE'
+          ? '本机文案配置格式异常，请重新保存文案或恢复默认。' : '本机台账格式异常；操作停止。');
       }
     }
     function write(store, key, value) {
@@ -772,9 +790,9 @@
       return text; // 原样保存空白和换行；提交时不擅自改写。
     }
     function snapshot() {
-      const value = Ledger.read(localStorage, Config.templatesKey, null);
+      const value = Ledger.read(localStorage, Config.templatesKey, null, 'INVALID_TEMPLATE');
       if (value === null) return defaults();
-      if (value.schema !== 1) throw new HelperError('INVALID_TEMPLATE', '本机文案配置格式异常，请重新保存文案。');
+      if (value?.schema !== 1) throw new HelperError('INVALID_TEMPLATE', '本机文案配置格式异常，请重新保存文案。');
       return { replyText: validate('reply', value.replyText), reportText: validate('report', value.reportText) };
     }
     function save(kind, text) {
@@ -814,32 +832,40 @@
         if (signature !== last) { last = signature; return false; }
         if (!ReviewDOM.groups().length && !ReviewDOM.empty()) return false;
         return { signature, page: ReviewDOM.page() };
-      }, { ...options, timeoutMs: Config.resultTimeoutMs, stableMs: Config.resultStableMs, description });
+      }, { ...options, timeoutMs: Config.resultTimeoutMs, stableMs: Config.resultStableMs,
+        retryCodes: ['PAGE_UNREADABLE', 'PAGE_AMBIGUOUS'], description });
     }
     async function transition(click, options, targetPage, currentTableOnly = false) {
-      const fingerprint = currentTableOnly ? ReviewDOM.tableFingerprint : ReviewDOM.fingerprint;
-      const before = fingerprint();
-      let activity = false;
+      const before = ReviewDOM.tableFingerprint();
+      let dataRedrawn = false;
+      let loadingObserved = false;
       const table = ReviewDOM.table();
       const observer = new MutationObserver(records => {
-        if (records.some(record => table.contains(record.target) || record.target === table ||
-            [...record.addedNodes, ...record.removedNodes].some(node =>
-              node.nodeType === 1 && (node.matches?.(Config.selectors.table) || node.contains(table))) ||
-            record.target.closest?.(Config.selectors.pagination) ||
-            record.target.closest?.(Config.selectors.loading))) activity = true;
+        for (const record of records) {
+          // class/页码的乐观更新不证明新数据已到达；只接受表格内容重绘或明确加载周期。
+          if (record.type === 'childList' && (table.contains(record.target) || record.target === table) &&
+              [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1 &&
+                (node.matches?.(`${Config.selectors.group}, ${Config.selectors.row}`) ||
+                  node.querySelector?.(Config.selectors.group)))) dataRedrawn = true;
+          if (record.type === 'attributes' && record.attributeName === 'aria-busy' &&
+              record.oldValue === 'true') loadingObserved = true;
+          if (ReviewDOM.all(Config.selectors.loading, DOM.root() || document).some(DOM.visible)) loadingObserved = true;
+        }
       });
-      observer.observe(DOM.root(), { subtree: true, childList: true, characterData: true,
-        attributes: true, attributeFilter: ['class', 'aria-busy', 'style'] });
+      observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true,
+        attributes: true, attributeOldValue: true, attributeFilter: ['class', 'aria-busy', 'style'] });
       try {
         options.guard();
         click();
         await Wait.until(() => {
-          if (ReviewDOM.busy()) { activity = true; return false; }
-          if (fingerprint() !== before) activity = true;
-          if (currentTableOnly) return activity;
+          if (ReviewDOM.busy()) { loadingObserved = true; return false; }
+          const dataReady = dataRedrawn || loadingObserved || ReviewDOM.table() !== table ||
+            ReviewDOM.tableFingerprint() !== before;
+          if (currentTableOnly) return dataReady;
           const page = ReviewDOM.page();
-          return activity && (targetPage === undefined || page.number === targetPage);
+          return dataReady && (targetPage === undefined || page.number === targetPage);
         }, { ...options, timeoutMs: Config.resultTimeoutMs, stableMs: 0,
+          retryCodes: ['PAGE_UNREADABLE', 'PAGE_AMBIGUOUS'],
           description: `等待查询/翻页完成${targetPage ? `（第${targetPage}页）` : ''}` });
         return await (currentTableOnly ? currentTableStable(options) : stable(options));
       } finally {
@@ -895,9 +921,15 @@
       link.scrollIntoView({ block: 'center', behavior: 'instant' });
       link.click();
       await Wait.until(() => {
-        if (!ReviewDOM.modals().length) return false;
-        return ReviewDOM.modal();
-      }, { ...options, description: '等待快捷回复弹框' });
+        const modals = ReviewDOM.modals();
+        if (!modals.length) return false;
+        const title = modals.length === 1 ? ReviewDOM.text(modals[0].querySelector(Config.selectors.modalTitle)) : '';
+        if (modals.length > 1 || title && title !== '快捷回复') {
+          throw new HelperError('UNEXPECTED_MODAL', '未出现唯一“快捷回复”弹框，已停止。');
+        }
+        return title === '快捷回复' &&
+          ReviewDOM.one(Config.selectors.replyInput, '回复输入框', modals[0], true);
+      }, { ...options, description: '等待快捷回复弹框及输入框' });
       const input = ReviewDOM.one(Config.selectors.replyInput, '回复输入框', ReviewDOM.modal());
       if (input.value) throw new HelperError('EXISTING_REPLY_TEXT', '弹框已有文字，可能存在历史互动；未覆盖或提交。');
       if (rec.replyText.length > 200 || input.maxLength > 0 && input.maxLength < rec.replyText.length) {
@@ -906,9 +938,9 @@
       ReviewDOM.setValue(input, rec.replyText);
       await Wait.until(() => {
         const modal = ReviewDOM.modal();
-        const current = ReviewDOM.one(Config.selectors.replyInput, '回复输入框', modal);
-        const button = ReviewDOM.one(Config.selectors.replyButton, '提交回复按钮', modal);
-        return current.value === rec.replyText && DOM.enabled(button);
+        const current = ReviewDOM.one(Config.selectors.replyInput, '回复输入框', modal, true);
+        const button = ReviewDOM.one(Config.selectors.replyButton, '提交回复按钮', modal, true);
+        return current?.value === rec.replyText && button && DOM.enabled(button);
       }, { ...options, description: '核验完整回复文案及提交按钮' });
       await Wait.until(() => !ReviewDOM.successMessages().length,
         { ...options, description: '等待上一条成功提示消失' });
@@ -933,8 +965,12 @@
         if (current.value !== rec.replyText || !DOM.enabled(button)) {
           throw new HelperError('REPLY_NOT_READY', '提交前文案或按钮状态改变。');
         }
-        Ledger.submission(rec, 'submitting');
-        Ledger.saveBatch(batch);
+        const previousStatus = rec.status;
+        rec.status = 'submitting';
+        try {
+          Ledger.saveBatch(batch); // 可失败的展示快照先保存；持久预登记后立即点击。
+          Ledger.submission(rec, 'submitting');
+        } catch (error) { rec.status = previousStatus; throw error; }
         submitted = true;
         armed = true;
         button.click(); // 持久化状态后仅提交一次；未知结果禁止自动重发。
@@ -1168,10 +1204,11 @@
         throw error;
       }
     }
-    function reason(element) {
+    function reason(element, optional = false) {
       const labels = ReviewDOM.all(Config.selectors.reportReason, element)
         .filter(label => DOM.visible(label) && ReviewDOM.text(label) === Config.reportReason &&
           label.querySelector('input[data-tracking-viewid="bad_peer_reviews"]'));
+      if (!labels.length && optional) return null;
       if (labels.length !== 1) throw new HelperError('REPORT_REASON_UNAVAILABLE', '同行恶意差评选项不可唯一定位。');
       return labels[0];
     }
@@ -1212,6 +1249,11 @@
         : data.modalCount === 0 && freshSuccess ? 'fresh_report_success' : '';
       return data;
     }
+    function evidenceSignature(reading) {
+      // 全局通知仅作诊断，不能使同一评价的稳定受理状态持续失效。
+      const { notices, ...evidence } = reading;
+      return evidence;
+    }
     function diagnostics(rec, reading) {
       const data = { ...reading, observedAt: new Date().toISOString() };
       try {
@@ -1232,9 +1274,10 @@
       return data;
     }
     function reported(group) {
-      const region = group.querySelector('[data-tracking-click-viewid="report"]');
-      return acceptedStatus(group).accepted ||
-        Boolean(region && /^(?:已举报|举报处理中|举报成功)$/.test(ReviewDOM.text(region)));
+      const regions = ReviewDOM.all('[data-tracking-click-viewid="report"]', group).filter(DOM.visible);
+      const activeLink = ReviewDOM.all(Config.selectors.reportLink, group).some(DOM.visible);
+      return acceptedStatus(group).accepted || !activeLink &&
+        regions.some(region => /^(?:已举报|举报处理中|举报成功)$/.test(ReviewDOM.text(region)));
     }
     function successMessages() {
       return ReviewDOM.all('div, span, p, [role="status"], [role="alert"]').filter(element =>
@@ -1243,7 +1286,7 @@
         !element.querySelector('input, textarea'));
     }
     return Object.freeze({ eligible, toggle, selectStar, stars, current, modal, waitModal, reason,
-      reasonSelected, reported, acceptedStatus, submissionState, diagnostics, successMessages });
+      reasonSelected, reported, acceptedStatus, submissionState, evidenceSignature, diagnostics, successMessages });
   })();
 
   const ReportLedger = (() => {
@@ -1258,6 +1301,7 @@
       const data = Ledger.read(localStorage, Config.reportJournalKey, { schema: 1, attempts: [] });
       if (data?.schema !== 1 || !Array.isArray(data.attempts) ||
           data.attempts.some(entry => !entry || !statuses.includes(entry.status) ||
+            entry.history !== undefined && !Array.isArray(entry.history) ||
             typeof entry.id !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.day) ||
             ![entry.order, entry.goodsId, entry.time].every(value => typeof value === 'string' && value.length) ||
             entry.key !== ReviewDOM.recordKey(entry)) ||
@@ -1296,7 +1340,8 @@
       if (!entry || !['submitting', 'submitted_unverified'].includes(entry.status)) {
         throw new HelperError('REPORT_JOURNAL_CHANGED', '举报提交台账变化，需人工核验。');
       }
-      entry.history.push({ status: entry.status, at: entry.at, evidence: entry.evidence });
+      entry.history = [...(entry.history || []),
+        { status: entry.status, at: entry.at, evidence: entry.evidence }];
       Object.assign(entry, { status, evidence, at: new Date().toISOString() });
       if (rec.submissionDiagnostics) entry.submissionDiagnostics = rec.submissionDiagnostics;
       Ledger.write(localStorage, Config.reportJournalKey, data);
@@ -1335,7 +1380,8 @@
         if (!entry || !['submitting', 'submitted_unverified'].includes(entry.status)) {
           throw new HelperError('NO_UNCERTAIN_ENTRY', '没有该提交对应的未知举报。');
         }
-        entry.history.push({ status: entry.status, at: entry.at, evidence: entry.evidence });
+        entry.history = [...(entry.history || []),
+          { status: entry.status, at: entry.at, evidence: entry.evidence }];
         entry.status = verdict;
         entry.at = new Date().toISOString();
         entry.manualVerification = { note: String(note), at: entry.at };
@@ -1359,7 +1405,8 @@
         if (ReviewDOM.busy()) { signature = undefined; return false; }
         const values = uncertain.map(entry => ({ id: entry.id,
           reading: ReportDOM.submissionState({ ...entry, content: entry.content ?? Config.reportContent }) }));
-        const current = JSON.stringify({ table: ReviewDOM.tableFingerprint(), values });
+        const current = JSON.stringify(values.map(({ id, reading }) =>
+          ({ id, reading: ReportDOM.evidenceSignature(reading) })));
         if (current !== signature) { signature = current; return false; }
         return values;
       }, { ...options, description: '核验同一评价的已举报待审核状态' });
@@ -1404,7 +1451,15 @@
       }
       link.scrollIntoView({ block: 'center', behavior: 'instant' });
       link.click();
-      await ReportDOM.waitModal(rec, rec.star, options, 'opened');
+      try {
+        await ReportDOM.waitModal(rec, rec.star, options, 'opened', modal => {
+          const choice = ReportDOM.reason(modal, true);
+          return choice && DOM.enabled(choice) && DOM.enabled(choice.querySelector('input'));
+        });
+      } catch (error) {
+        if (error.code === 'TIMEOUT') throw new HelperError('REPORT_REASON_UNAVAILABLE', '举报原因选项未能加载或不可用。');
+        throw error;
+      }
       ReportDOM.current(rec, rec.star);
       const choice = ReportDOM.reason(ReportDOM.modal(rec, rec.star));
       if (!DOM.enabled(choice) || !DOM.enabled(choice.querySelector('input'))) {
@@ -1412,7 +1467,8 @@
       }
       if (!ReportDOM.reasonSelected(ReportDOM.modal(rec, rec.star))) choice.click();
       await ReportDOM.waitModal(rec, rec.star, options, 'reason_selected', modal => {
-        return ReportDOM.reasonSelected(modal) && modal.querySelector(Config.selectors.reportInput);
+        return ReportDOM.reasonSelected(modal) &&
+          ReviewDOM.one(Config.selectors.reportInput, '举报说明输入框', modal, true);
       });
       const input = ReviewDOM.one(Config.selectors.reportInput, '举报说明输入框', ReportDOM.modal(rec, rec.star));
       if (input.value) throw new HelperError('EXISTING_REPORT_TEXT', '举报框已有说明，未覆盖或提交。');
@@ -1422,9 +1478,9 @@
       }
       ReviewDOM.setValue(input, rec.reportText);
       await ReportDOM.waitModal(rec, rec.star, options, 'text_filled', modal => {
-        const button = ReviewDOM.one(Config.selectors.reportButton, '提交举报按钮', modal);
-        return ReviewDOM.one(Config.selectors.reportInput, '举报说明', modal).value === rec.reportText &&
-          ReportDOM.reasonSelected(modal) && DOM.enabled(button) &&
+        const button = ReviewDOM.one(Config.selectors.reportButton, '提交举报按钮', modal, true);
+        return ReviewDOM.one(Config.selectors.reportInput, '举报说明', modal, true)?.value === rec.reportText &&
+          ReportDOM.reasonSelected(modal) && button && DOM.enabled(button) &&
           button.getAttribute('data-tracking-click-params') === 'reason_type=8';
       });
       await Wait.until(() => !ReportDOM.successMessages().length,
@@ -1448,8 +1504,12 @@
             !DOM.enabled(button) || button.getAttribute('data-tracking-click-params') !== 'reason_type=8') {
           throw new HelperError('REPORT_NOT_READY', '举报提交前表单状态改变。');
         }
-        ReportLedger.reserve(rec, batch);
-        ReportLedger.saveBatch(batch);
+        const previousStatus = rec.status;
+        rec.status = 'submitting';
+        try {
+          ReportLedger.saveBatch(batch);
+          ReportLedger.reserve(rec, batch);
+        } catch (error) { rec.status = previousStatus; throw error; }
         submitted = true;
         armed = true;
         button.click();
@@ -1457,7 +1517,7 @@
           if (ReportDOM.successMessages().length) freshSuccess = true;
           lastReading = ReportDOM.submissionState(rec, freshSuccess);
           rec.submissionDiagnostics = { ...lastReading, observedAt: new Date().toISOString() };
-          const current = JSON.stringify(lastReading);
+          const current = JSON.stringify(ReportDOM.evidenceSignature(lastReading));
           if (current !== signature) { signature = current; return false; }
           return lastReading.evidence;
         }, { ...options, timeoutMs: Config.submissionTimeoutMs,
@@ -1474,7 +1534,7 @@
           ReportLedger.update(rec, 'submitted_unverified', error.code || error.message);
           ReportLedger.saveBatch(batch);
           throw Object.assign(new HelperError('REPORT_SUBMITTED_UNVERIFIED',
-            '本次已发出一次举报但结果不明；未计成功，保留待核验记录并停止。再次运行将跳过该条并处理其他评价。'),
+            '本条已发出一次举报但结果不明；未计成功，保留待核验且不重发。页面可操作时继续其他评价。'),
           { details: rec.submissionDiagnostics });
         }
         throw error;
@@ -1498,7 +1558,8 @@
       let filterSignature;
       options.guard = () => {
         originalGuard();
-        if (filterSignature && ReviewDOM.filterSignature() !== filterSignature) {
+        const current = filterSignature && ReviewDOM.filterSignature(true);
+        if (current && current !== filterSignature) {
           throw new HelperError('FILTER_CHANGED', '举报期间查询条件改变，已停止。');
         }
       };
@@ -1508,8 +1569,16 @@
         const observedHistory = new Set();
         const refreshHistory = async () => {
           const recovered = await ReportLedger.reconcile(options, observedHistory);
-          batch.reconciled.push(...recovered.map(entry => ({ id: entry.id, day: entry.day, key: entry.key })));
-          ReportLedger.saveBatch(batch); // 历史恢复只更新台账，不增加本次成功数。
+          for (const entry of recovered) {
+            const current = batch.records.find(rec => rec.attemptId === entry.id &&
+              ['submitting', 'submitted_unverified'].includes(rec.status));
+            if (current) {
+              current.status = 'confirmed';
+              current.evidence = entry.evidence;
+              current.confirmedLater = true;
+            } else batch.reconciled.push({ id: entry.id, day: entry.day, key: entry.key });
+          }
+          ReportLedger.saveBatch(batch); // 旧历史不计目标；本次尝试稍后确认仍计入本次。
         };
         let turns = 0;
         const turn = async direction => {
@@ -1558,11 +1627,13 @@
           if (batch.summary.reported >= target) break;
           options.guard();
           await queryStar(label);
+          await Results.stable(options);
           if (ReviewDOM.page().number !== 1) throw new HelperError('QUERY_PAGE_MISMATCH', '查询未返回第一页，已停止。');
           while (batch.summary.reported < target) {
             options.guard();
             await Results.stable(options);
             await refreshHistory();
+            if (batch.summary.reported >= target) break;
             const current = Results.nextRecord(seen, batch.shop);
             if (!current) {
               if (!ReviewDOM.canTurn(ReviewDOM.page().next)) break;
@@ -1589,7 +1660,22 @@
             } else if (prior?.status === 'confirmed') rec.status = 'skipped_previously_reported';
             else if (!ReportDOM.eligible(rec, strategy)) rec.status = 'skipped_non_template';
             else if (ReportDOM.reported(group)) rec.status = 'skipped_already_reported';
-            else await Reports.submit(rec, batch, options);
+            else {
+              try { await Reports.submit(rec, batch, options); }
+              catch (error) {
+                if (error.code !== 'REPORT_SUBMITTED_UNVERIFIED') throw error;
+                options.guard();
+                // 已发出但不明只隔离此条；弹框已关闭且列表可操作时继续本次目标。
+                // 有弹框时不能把后续点击送入未知对话框，保留原错误与诊断。
+                if (ReviewDOM.modals().length) {
+                  error.message = '本条举报结果待核验，弹框仍未关闭；当前批次暂停，请检查弹框后重新运行。';
+                  throw error;
+                }
+                rec.error = { code: error.code, message: error.message };
+                await Results.stable(options);
+                Actions.update({ tone: 'info', message: '本条结果待核验，已保留记录且不会重复发送；继续处理下一条。' });
+              }
+            }
             ReportLedger.saveBatch(batch);
             Actions.update({ message: `${label}：成功举报${batch.summary.reported}/${batch.target ?? '全部'}条；检查${batch.summary.checked}条，跳过${batch.summary.skipped}条。` });
             if (rec.status === 'confirmed' && batch.summary.reported < target) {
@@ -1606,6 +1692,7 @@
         const descriptions = { target_reached: '已达到本次成功举报目标',
           stars_exhausted: `${strategy === 'one-star-all' ? '1星' : '1星、2星、3星'}结果已全部处理，暂无需要处理的评价` };
         Actions.update({ tone: 'success', message: `举报结束：本次成功${batch.summary.reported}条，检查${batch.summary.checked}条，跳过${batch.summary.skipped}条。${descriptions[batch.stopReason]}。`
+          + (batch.summary.pending ? `本次${batch.summary.pending}条结果待核验，未计成功且未重复发送。` : '')
           + (batch.summary.skippedPending ? `其中${batch.summary.skippedPending}条为历史待核验，已跳过且未重复举报。` : '') });
         return { ok: true, ...batch.summary, stats: ReportLedger.stats(), batch };
       } catch (error) {
@@ -1621,6 +1708,8 @@
 
   const Workflow = (() => {
     let navigating = false;
+    let navigationTimer;
+    let navigationExpired = false;
     function params(value = {}) {
       const rawN = value.n;
       const absentN = rawN === undefined || rawN === null || rawN === '';
@@ -1656,7 +1745,8 @@
       let filterSignature;
       options.guard = () => {
         initialGuard();
-        if (filterSignature && ReviewDOM.filterSignature() !== filterSignature) {
+        const current = filterSignature && ReviewDOM.filterSignature(true);
+        if (current && current !== filterSignature) {
           throw new HelperError('FILTER_CHANGED', '批次期间查询条件改变，已停止。');
         }
       };
@@ -1760,13 +1850,25 @@
         action: taskMode === 'report' ? 'report-batch' : 'start-batch',
         sourceUrl: location.href, params: p, templates, at: Date.now() });
       navigating = true;
+      navigationExpired = false;
       Actions.update({ busy: true, taskMode, tone: 'info', message: '正在进入评价页，随后自动执行…' });
+      const recover = message => {
+        Ledger.remove(sessionStorage, Config.pendingKey);
+        clearTimeout(navigationTimer);
+        navigating = false;
+        Actions.update({ busy: false, taskMode, tone: 'error', message });
+      };
+      navigationTimer = setTimeout(() => {
+        if (!navigating) return;
+        navigationExpired = true;
+        try { recover('未完成评价页跳转，待执行任务已取消。请检查离页提示或网络后重新运行。'); }
+        catch (error) { Actions.update({ taskMode, tone: 'error', message: error.message }); }
+      }, Config.resultTimeoutMs);
       try {
         location.assign(Config.evaluationUrl);
       } catch (error) {
-        Ledger.remove(sessionStorage, Config.pendingKey);
-        navigating = false;
-        Actions.update({ busy: false, tone: 'error', message: '评价页跳转失败，请重新执行。' });
+        navigationExpired = true;
+        recover('评价页跳转失败，待执行任务已取消，请重新执行。');
         throw error;
       }
       return { navigating: true };
@@ -1779,7 +1881,11 @@
       const taskMode = Actions.status().busy ? Actions.status().taskMode : Panel.taskMode();
       const stopped = Actions.cancel();
       const hadPending = Ledger.remove(sessionStorage, Config.pendingKey);
-      if (navigating || hadPending) {
+      if (navigating && navigationExpired) {
+        clearTimeout(navigationTimer);
+        navigating = false;
+        Actions.update({ busy: false, taskMode, tone: 'info', message: '已清除超时的跳转任务，可以重新运行。' });
+      } else if (navigating || hadPending) {
         // 浏览器导航可能已经发出；保留导航锁直到离开/返回，防止再次启动。
         Actions.update({ taskMode, tone: 'info',
           message: '已急停：待执行任务已清除，评价页加载后不会继续。已提交的操作无法撤销。' });
@@ -1849,7 +1955,9 @@
     }
     function restoreNavigation() {
       if (!navigating) return;
+      clearTimeout(navigationTimer);
       navigating = false;
+      navigationExpired = false;
       Actions.update({ busy: false, tone: 'info', message: '已返回页面，点击“一键运行”可重新启动。' });
     }
     return Object.freeze({ start, oneClickRun, startReport: value => start(value, 'report'),
@@ -2261,7 +2369,9 @@
       shadow.querySelector('#report-status').dataset.tone = modeStatus.report.tone;
       shadow.querySelector('#report-inspection').textContent = reportReading.message;
       shadow.querySelector('#report-inspection').dataset.tone = reportReading.tone;
-      const batch = layout.taskMode === 'report' ? ReportLedger.lastBatch() : Ledger.lastBatch();
+      let batch;
+      try { batch = layout.taskMode === 'report' ? ReportLedger.lastBatch() : Ledger.lastBatch(); }
+      catch { /* 检查状态已显示错误；坏旧快照不阻止新批次覆盖。 */ }
       const counts = batch?.summary;
       const compact = shadow.querySelector('#compact-count');
       const label = status.busy ? '运行中' : batch?.phase === 'stopped' ? '已停止'

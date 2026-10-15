@@ -359,24 +359,33 @@ async function main() {
     assert.equal(s.submissions.length, 0);
     assert.equal(s.stats.uncertain, 0);
   });
-  test('无成功提示关闭弹框仍未知；后续批跳过旧条，只对另一记录提交', 'unknown', async page => {
+  test('无成功提示关闭弹框只记未知并继续全星级；后续批跳过全部旧条不重发', 'unknown', async page => {
     const result = await run(page, { n: 1 });
-    assert.equal(result.code, 'REPORT_SUBMITTED_UNVERIFIED');
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual([result.reported, result.pending, result.checked], [0, 5, 8]);
     let s = await state(page);
-    assert.equal(s.submissions.length, 1);
+    assert.equal(s.batch.phase, 'completed');
+    assert.equal(s.batch.stopReason, 'stars_exhausted');
+    assert.deepEqual(s.queries.map(entry => entry.star), [1, 2, 3]);
+    assert.equal(s.submissions.length, 5);
     assert.equal(s.batch.summary.reported, 0);
-    assert.equal(s.journal.attempts[0].status, 'submitted_unverified');
-    assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [0, 1]);
-    assert.equal((await run(page)).code, 'REPORT_SUBMITTED_UNVERIFIED');
+    assert.ok(s.journal.attempts.every(entry => entry.status === 'submitted_unverified'));
+    assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [0, 5]);
+    assert.equal((await run(page)).ok, true);
     s = await state(page);
-    assert.equal(s.submissions.length, 2);
-    assert.equal(new Set(s.submissions.map(entry => entry.order)).size, 2);
-    assert.equal(s.batch.summary.skippedPending, 1);
+    assert.equal(s.submissions.length, 5);
+    assert.equal(new Set(s.submissions.map(entry => entry.order)).size, 5);
+    assert.deepEqual([s.batch.summary.reported, s.batch.summary.pending, s.batch.summary.skippedPending], [0, 0, 5]);
   });
   test('旧成功提示不算本次成功', 'stale-toast', async page => {
-    assert.equal((await run(page, { n: 1 })).code, 'REPORT_SUBMITTED_UNVERIFIED');
-    assert.equal((await state(page)).stats.confirmed, 0);
-    assert.equal((await state(page)).submissions.length, 1);
+    const result = await run(page, { n: 1 });
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual([result.reported, result.pending], [0, 5]);
+    const s = await state(page);
+    assert.equal(s.batch.phase, 'completed');
+    assert.equal(s.stats.confirmed, 0);
+    assert.equal(s.submissions.length, 5);
+    assert.equal(new Set(s.submissions.map(entry => entry.order)).size, 5);
   });
   test('前日不可见未知不阻止本次新记录，旧条不重发', 'normal', async page => {
     await seed(page, 1, 'submitted_unverified', '2026-10-01');
@@ -385,6 +394,7 @@ async function main() {
     assert.equal((await state(page)).stats.uncertain, 1);
   });
   test('人工确认成功增加累计成功数并保留核验历史', 'unknown', async page => {
+    await page.evaluate(() => { window.sim.records = [window.sim.records[1]]; window.renderFixture(); });
     await run(page, { n: 1 });
     const s = await state(page);
     const entry = await page.evaluate(id =>
@@ -395,6 +405,7 @@ async function main() {
     assert.equal((await state(page)).stats.uncertain, 0);
   });
   test('人工确认未提交后重新提交使用新attempt并保留旧依据', 'unknown', async page => {
+    await page.evaluate(() => { window.sim.records = [window.sim.records[1]]; window.renderFixture(); });
     await run(page, { n: 1 });
     const s = await state(page);
     await page.evaluate(id => window.PDDEvaluationHelper.resolveReportSubmission(
@@ -419,11 +430,13 @@ async function main() {
     });
     await page.waitForFunction(() => window.sim.submissions.length === 1);
     await panel(page).locator('#report-stop').click();
-    assert.equal((await page.evaluate(() => window.pending)).code, 'REPORT_SUBMITTED_UNVERIFIED');
+    assert.equal((await page.evaluate(() => window.pending)).code, 'CANCELLED');
     const s = await state(page);
     assert.equal(s.batch.summary.reported, 0);
     assert.equal(s.stats.uncertain, 1);
     assert.equal(s.submissions.length, 1);
+    assert.equal(s.batch.phase, 'stopped');
+    assert.equal(s.batch.error.code, 'CANCELLED');
   });
   test('运行期间禁用切换；折叠最小化急停仍有效', 'query-noop', async page => {
     await page.evaluate(() => {

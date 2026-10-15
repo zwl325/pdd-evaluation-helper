@@ -62,13 +62,94 @@ test('同一旧未知只跳过该条，继续跨星级直到本次成功目标',
   assert.ok(s.submissions.every(r => r.order !== s.records[1].order));
   assert.equal(s.stats.uncertain, 1);
 });
-test('本次未知停止后再次运行重置批次并处理其他评价，不重发旧条', async page => {
-  await page.evaluate(() => { window.sim.acceptanceScenario = 'body'; });
-  assert.equal((await run(page, { n: 5 })).code, 'REPORT_SUBMITTED_UNVERIFIED');
+test('首条结果未知继续下一条成功达到数量，未知单独计数且两次运行身份不重发', async page => {
+  await page.evaluate(() => {
+    const first = window.sim.records[1];
+    window.sim.records = [first,
+      { ...first, order: '880000-000000098', time: '2026-10-14 12:00:01' },
+      { ...first, order: '880000-000000099', time: '2026-10-14 12:00:02' }];
+    document.addEventListener('click', event => {
+      if (event.target.matches('button[data-tracking-viewid="new_confirm_report_btn"]')) {
+        window.sim.acceptanceScenario = window.sim.submissions.length === 0 ? 'body' : 'header';
+      }
+    }, true);
+    window.renderFixture();
+  });
+  const result = await run(page, { n: 1 });
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual([result.reported, result.pending, result.checked, result.skipped], [1, 1, 2, 0]);
   const old = await state(page);
+  assert.equal(old.batch.phase, 'completed');
+  assert.equal(old.batch.stopReason, 'target_reached');
+  assert.equal(old.batch.error, undefined);
+  assert.equal(old.submissions.length, 2);
+  assert.deepEqual(old.batch.records.map(rec => rec.status), ['submitted_unverified', 'confirmed']);
+  assert.deepEqual(old.journal.attempts.map(rec => rec.status), ['submitted_unverified', 'confirmed']);
+  assert.deepEqual([old.stats.confirmed, old.stats.uncertain], [1, 1]);
+  assert.deepEqual(old.queries.map(q => q.star), [1]);
+  assert.ok(!old.submissions.some(rec => rec.order === old.records[2].order));
+  assert.match(await panel(page).locator('#report-status').innerText(), /本次1条结果待核验/);
+  assert.equal((await run(page, { n: 1 })).reported, 1);
+  const next = await state(page);
+  assert.notEqual(next.batch.id, old.batch.id);
+  assert.deepEqual([next.batch.summary.reported, next.batch.summary.pending,
+    next.batch.summary.skippedPending], [1, 0, 1]);
+  assert.equal(next.submissions.length, 3);
+  assert.equal(new Set(next.submissions.map(rec => rec.order)).size, 3);
+  assert.deepEqual([next.stats.confirmed, next.stats.uncertain], [2, 1]);
+  assert.deepEqual(next.journal.attempts[0].submissionDiagnostics, old.journal.attempts[0].submissionDiagnostics);
+});
+test('本次未知稍后显示同记录受理，核验计入本次目标后立即结束不新增提交', async page => {
+  await page.evaluate(() => {
+    const first = window.sim.records[1];
+    window.sim.records = [first,
+      { ...first, order: '880000-000000098', time: '2026-10-14 12:00:01' }];
+    window.sim.acceptanceScenario = 'body';
+    window.renderFixture();
+    const watcher = setInterval(() => {
+      const batch = window.PDDEvaluationHelper.readReportBatch();
+      if (!batch?.records.some(rec => rec.status === 'submitted_unverified')) return;
+      clearInterval(watcher);
+      first.statusPlacement = '';
+      first.acceptedText = '已举报，待审核';
+      window.renderFixture();
+    }, 20);
+  });
+  const result = await run(page, { n: 1 });
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual([result.reported, result.pending, result.checked], [1, 0, 1]);
+  const s = await state(page);
+  assert.equal(s.batch.phase, 'completed');
+  assert.equal(s.batch.stopReason, 'target_reached');
+  assert.equal(s.submissions.length, 1);
+  assert.equal(s.batch.records[0].confirmedLater, true);
+  assert.equal(s.batch.records[0].evidence, 'record_report_accepted');
+  assert.equal(s.batch.reconciled.length, 0);
+  assert.equal(s.journal.attempts[0].status, 'confirmed');
+  assert.equal(s.journal.attempts[0].history.at(-1).status, 'submitted_unverified');
+  assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [1, 0]);
+  assert.deepEqual(s.queries.map(q => q.star), [1]);
+});
+test('本次未知后继续完成，再次运行重置批次并处理新评价，不重发旧条', async page => {
+  await page.evaluate(() => {
+    window.sim.acceptanceScenario = 'body';
+    window.sim.records = [window.sim.records[1]];
+    window.renderFixture();
+  });
+  const result = await run(page, { n: 5 });
+  assert.equal(result.ok, true, result.message);
+  const old = await state(page);
+  assert.equal(old.batch.phase, 'completed');
+  assert.equal(old.batch.stopReason, 'stars_exhausted');
   assert.equal(old.batch.summary.pending, 1);
   assert.equal(old.batch.summary.reported, 0);
-  await page.evaluate(() => { window.sim.acceptanceScenario = 'header'; });
+  await page.evaluate(() => {
+    window.sim.acceptanceScenario = 'header';
+    const old = window.sim.records[0];
+    window.sim.records.push({ ...old, order: '880000-000000099', time: '2026-10-14 12:00:00',
+      reported: false, acceptedText: '', statusPlacement: '' });
+    window.renderFixture();
+  });
   assert.equal((await run(page, { n: 1 })).reported, 1);
   const s = await state(page);
   assert.notEqual(s.batch.id, old.batch.id);
@@ -160,9 +241,17 @@ test('旧未知不存在于当前日期结果时不追查、不改写原诊断',
   assert.equal(s.stats.uncertain, 1);
 });
 test('无成功证据的新提交仍不计成功，导出有限DOM诊断且保留等待错误', async page => {
-  await page.evaluate(() => { window.sim.acceptanceScenario = 'body'; });
-  assert.equal((await run(page)).code, 'REPORT_SUBMITTED_UNVERIFIED');
+  await page.evaluate(() => {
+    window.sim.acceptanceScenario = 'body';
+    window.sim.records = [window.sim.records[1]];
+    window.renderFixture();
+  });
+  const result = await run(page);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual([result.reported, result.pending], [0, 1]);
   const s = await state(page);
+  assert.equal(s.batch.phase, 'completed');
+  assert.equal(s.batch.error, undefined);
   assert.equal(s.batch.summary.pending, 1);
   const d = s.journal.attempts[0].submissionDiagnostics;
   assert.equal(d.status.accepted, false);

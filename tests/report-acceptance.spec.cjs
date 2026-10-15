@@ -66,20 +66,37 @@ async function main() {
   for (const scenario of ['other-row', 'body', 'hidden', 'link-still', 'wrong-identity',
     'wrong-star', 'keep-modal', 'flash', 'failed']) {
     test(`${scenario}不构成同一记录的稳定受理证据，保留未知且不重试`, async page => {
-      await page.evaluate(scenario => { window.sim.acceptanceScenario = scenario; }, scenario);
-      assert.equal((await run(page)).code, 'REPORT_SUBMITTED_UNVERIFIED');
+      await page.evaluate(scenario => {
+        window.sim.acceptanceScenario = scenario;
+        // 保留另一行供other-row伪证据使用，但不把它作为第二个可举报候选。
+        window.sim.records[1].content = '其他评价';
+        window.renderFixture();
+      }, scenario);
+      const result = await run(page);
+      if (scenario === 'keep-modal') assert.equal(result.code, 'REPORT_SUBMITTED_UNVERIFIED');
+      else {
+        assert.equal(result.ok, true, result.message);
+        assert.deepEqual([result.reported, result.pending], [0, 1]);
+        assert.equal(result.batch.phase, 'completed');
+        assert.equal(result.batch.error, undefined);
+      }
       const s = await state(page);
       assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [0, 1]);
       assert.equal(s.submissions.length, 1);
-      assert.equal(s.batch.error.details.stage, 'after_submit');
-      assert.equal(s.batch.error.details.waitError.code, 'TIMEOUT');
-      assert.deepEqual(s.journal.attempts[0].submissionDiagnostics, s.batch.error.details);
-      if (scenario === 'failed') assert.ok(s.batch.error.details.notices.includes('举报未受理，请稍后核实'));
-      if (scenario === 'keep-modal') assert.equal(s.batch.error.details.modalCount, 1);
+      const diagnostics = s.journal.attempts[0].submissionDiagnostics;
+      assert.equal(diagnostics.stage, 'after_submit');
+      assert.equal(diagnostics.waitError.code, 'TIMEOUT');
+      assert.deepEqual(s.batch.records[0].submissionDiagnostics, diagnostics);
+      if (scenario === 'failed') assert.ok(diagnostics.notices.includes('举报未受理，请稍后核实'));
+      if (scenario === 'keep-modal') {
+        assert.equal(s.batch.error.details.modalCount, 1);
+        assert.deepEqual(s.batch.error.details, diagnostics);
+      }
       const [download] = await Promise.all([page.waitForEvent('download'),
         page.evaluate(() => window.PDDEvaluationHelper.exportReportLedger())]);
       const exported = JSON.parse(fs.readFileSync(await download.path(), 'utf8'));
-      assert.deepEqual(exported.batch.error.details, s.batch.error.details);
+      assert.deepEqual(exported.journal.attempts[0].submissionDiagnostics, diagnostics);
+      assert.deepEqual(exported.batch.records[0].submissionDiagnostics, diagnostics);
     });
   }
   test('原已举报待审核记录跳过且不计新成功，继续下一条', async page => {
