@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-14.6
+// @name         PDD评价筛选助手 v2026-10-15.1
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-14.6
+// @version      2026-10-15.1
 // @description  PDD自动筛选回复与差评举报双模式，支持独立计数、每日举报限额、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-14.6',
+    version: '2026-10-15.1',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -394,6 +394,8 @@
       if (element === content || content?.contains(element)) return 'inside_content';
       for (let parent = element.parentElement; parent && parent !== wrapper; parent = parent.parentElement) {
         if (/(?:^|\s)logic_replyWrapper(?:_|$|\s)/.test(parent.className)) return 'merchant_reply';
+        // 追评容器不一定有独立可见标签；按现场诊断中的类名归属排除其时间。
+        if (/(?:^|\s)logic_appendWrapper(?:_|$|\s)/.test(parent.className)) return 'additional_review';
         const label = parent.firstElementChild;
         if (label && !label.contains(element) && DOM.visible(label)) {
           const match = sectionLabel.exec((label.innerText || '').trim());

@@ -107,6 +107,35 @@ async function main() {
     assert.equal(s.quota.confirmed, 2);
     assert.equal(s.quota.uncertain, 0);
   });
+  test('带追评时间的旧记录可核验恢复，目标2仍只新增1条', async page => {
+    await page.evaluate(() => {
+      const originalRender = window.renderFixture;
+      window.renderFixture = () => {
+        originalRender();
+        for (const wrapper of document.querySelectorAll('[class*="logic_reviewWrapper"]')) {
+          const appendix = document.createElement('div');
+          appendix.className = 'logic_appendWrapper__14p_G';
+          appendix.innerHTML = '<div>补充使用感受</div><div class="logic_replyTime__32PeR">2026-10-15 01:02:03</div>';
+          wrapper.append(appendix);
+        }
+      };
+    });
+    await seedUnknown(page);
+    const result = await run(page, { n: 2 });
+    assert.equal(result.reported, 2, result.message);
+    const s = await state(page);
+    assert.equal(s.batch.reconciled.length, 1);
+    assert.equal(s.batch.records[0].recovered, true);
+    assert.equal(s.submissions.length, 1);
+    assert.notEqual(s.submissions[0].order, s.records[0].order);
+    assert.equal(s.journal.attempts[0].id, 'synthetic-unknown');
+    assert.equal(s.journal.attempts[0].key,
+      JSON.stringify([s.records[0].order, s.records[0].goodsId, s.records[0].time]));
+    assert.equal(s.journal.attempts[0].history.at(-1).evidence, 'TIMEOUT');
+    assert.deepEqual([s.quota.confirmed, s.quota.uncertain, s.quota.used], [2, 0, 2]);
+    const submittedRecord = s.batch.records.find(record => !record.recovered);
+    assert.equal(submittedRecord.timeDiagnostics.ignoredCount, 1);
+  });
   test('旧1星记录先查询1星再核验，不依赖默认结果页', async page => {
     await seedUnknown(page);
     await page.evaluate(() => { window.sim.filterStar = 4; window.renderFixture(); });

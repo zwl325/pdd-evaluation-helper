@@ -18,6 +18,9 @@ const followup = `<section><div>追加评价</div><div>另一次评价的内容<
   <span class="logic_replyTime_followup">${otherTime}</span></section>`;
 const reply = `<section class="logic_replyWrapper_x"><div>店铺回复内容</div>
   <span class="logic_replyTime_reply">${otherTime}</span></section>`;
+// 现场诊断提供了追评容器类名；无需假定其首元素是独立的“追评”标签。
+const append = `<div class="logic_appendWrapper__14p_G"><div>用户后续补充的内容</div>
+  <div>购买后补充</div><div class="logic_replyTime__32PeR">${otherTime}</div></div>`;
 const scenarios = [
   { name: '同值兄弟节点合并且身份key与历史去重保持', markup: timeMarkup + timeMarkup, repeat: true },
   { name: '整页重复时间仍按原数量语义处理', markup: timeMarkup + timeMarkup, full: true },
@@ -33,6 +36,30 @@ const scenarios = [
   { name: '隐藏时间副本不参与身份', markup: timeMarkup +
     `<span class="logic_replyTime_hidden" style="display:none">${otherTime}</span>` },
   { name: '原始正文恰为追评二字不改变时间归属', markup: timeMarkup + timeMarkup, content: '追评', skip: true },
+  { name: '现场追评容器无需独立标签即可排除时间',
+    markup: timeMarkup + append, additional: 1 },
+  { name: '追评时间深层嵌套仍按祖先容器归属',
+    markup: timeMarkup + append.replace(`<div class="logic_replyTime__32PeR">${otherTime}</div>`,
+      `<section><div class="logic_replyTime__32PeR">${otherTime}</div></section>`), additional: 1 },
+  { name: '追评容器位于原始时间之前也不按位置猜测',
+    markup: append + timeMarkup, additional: 1 },
+  { name: '多个追评容器不同时间均不混入原始身份',
+    markup: timeMarkup + append + append.replace(otherTime, '2026-10-15 01:02:03'), additional: 2 },
+  { name: '含追评的整页记录可继续翻页达到原数量目标',
+    markup: timeMarkup + append, full: true, paginate: true, additional: 1 },
+  { name: '含追评的历史确认记录重新运行不重复提交',
+    markup: timeMarkup + append, repeat: true, additional: 1 },
+  { name: '只有追评容器时间时不借作原始时间',
+    markup: append, error: 'RECORD_TIME_MISSING', additional: 1 },
+  { name: '原始时间无效不能借用追评容器时间',
+    markup: '<span class="logic_replyTime_x">日期未知</span>' + append,
+    error: 'INCOMPLETE_RECORD', additional: 1 },
+  { name: '近似追评容器类名不作为排除证据',
+    markup: timeMarkup + append.replace('logic_appendWrapper__14p_G', 'logic_appendWrapperFake'),
+    error: 'RECORD_TIME_AMBIGUOUS', additional: 0 },
+  { name: '排除追评容器后仍有不同原始时间时继续停止',
+    markup: timeMarkup + `<span class="logic_replyTime_other">${otherTime}</span>` + append,
+    error: 'RECORD_TIME_AMBIGUOUS', additional: 1 },
   { name: '两个不同原始时间停止并保存诊断',
     markup: timeMarkup + `<span class="logic_replyTime_other">${otherTime}</span>`, error: 'RECORD_TIME_AMBIGUOUS' },
   { name: '不同时间反向排列也不按首个或最早时间猜测',
@@ -83,10 +110,15 @@ async function main() {
       page.on('pageerror', error => pageErrors.push(error.message));
       try {
         await page.goto('https://mms.pinduoduo.com/goods/evaluation/index?mode=normal');
-        await page.evaluate(({ mode, content, full }) => {
+        await page.evaluate(({ mode, content, full, paginate }) => {
           if (!full) window.sim.records = [window.sim.records[mode === 'report' ? 1 : 0]];
           if (content) window.sim.records[0].content = content;
-        }, { mode, content: scenario.content, full: scenario.full });
+          if (paginate) {
+            window.sim.pageSize = 1;
+            if (mode === 'reply') [window.sim.records[0], window.sim.records[1]] =
+              [window.sim.records[1], window.sim.records[0]];
+          }
+        }, { mode, content: scenario.content, full: scenario.full, paginate: scenario.paginate });
         await page.addScriptTag({ content: source });
         const limit = scenario.full ? 2 : 1;
         const result = await page.evaluate(({ mode, limit }) => {
@@ -100,6 +132,7 @@ async function main() {
           return { batch: mode === 'report' ? helper.readReportBatch() : helper.readBatch(),
             journal: mode === 'report' ? helper.readReportJournal() : helper.readSubmissionJournal(),
             quota: mode === 'report' ? helper.readReportQuota() : null,
+            visits: mode === 'report' ? window.sim.visits : window.sim.visited,
             submissions: window.sim.submissions, original: window.sim.records[0] };
         }, mode);
         if (scenario.error) {
@@ -126,7 +159,7 @@ async function main() {
           const exported = JSON.parse(fs.readFileSync(await download.path(), 'utf8'));
           assert.deepEqual(exported.batch.error.details, state.batch.error.details);
         } else {
-          assert.equal(result.ok, true, result.message);
+          assert.equal(result.ok, true, `${result.code || ''}: ${result.message || ''}`);
           const successes = scenario.skip ? 0 : scenario.full && mode === 'report' ? 2 : 1;
           assert.equal(state.submissions.length, successes);
           assert.equal(state.batch.summary.checked, scenario.full ? mode === 'report' ? 4 : 2 : 1);
@@ -153,6 +186,13 @@ async function main() {
             assert.equal(mode === 'report' ? repeated.result.reported : repeated.result.replied, 0);
           }
         }
+        if (scenario.additional !== undefined) {
+          const diagnostics = scenario.error ? state.batch.error.details : state.batch.records[0].timeDiagnostics;
+          assert.equal(diagnostics.candidates.filter(candidate => candidate.role === 'additional_review').length,
+            scenario.additional, '追评容器中的时间应有明确归属诊断');
+        }
+        if (scenario.paginate) assert.ok(state.visits.some(visit => visit.page === 2),
+          '追评回归必须实际访问第二页');
         assert.deepEqual(pageErrors, []);
         console.log(`PASS ${name}`);
       } catch (error) {
