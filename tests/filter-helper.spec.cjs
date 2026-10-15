@@ -133,7 +133,7 @@ async function main() {
   });
   test('面板保留一键运行、下方急停、检查状态、导出台账和文案入口', 'normal', async page => {
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('#body button').count(), 4);
+    assert.equal(await panel.locator('#body button').count(), 6);
     assert.equal(await panel.locator('#run-once').innerText(), '一键运行');
     assert.equal(await panel.locator('#stop').innerText(), '急停');
     assert.equal(await panel.locator('#stop').isDisabled(), false);
@@ -141,7 +141,7 @@ async function main() {
       .shadowRoot.getElementById('run-once').nextElementSibling.id), 'stop');
     assert.equal(await panel.locator('#refresh').innerText(), '检查状态');
     assert.equal(await panel.locator('#export-batch').innerText(), '导出本机台账');
-    assert.equal(await panel.locator('#reply-details summary').innerText(), '查看统一回复文案');
+    assert.equal(await panel.locator('#reply-details summary').innerText(), '查看／编辑统一回复文案');
     assert.equal(await panel.locator('.badge, [data-select], #all').count(), 0);
     assert.equal(await panel.locator('#collapse').innerText(), '收起');
     const before = await panel.locator('#status').innerText();

@@ -21,7 +21,7 @@ const state = (page, mode) => page.evaluate(mode => ({
   ...window.sim,
   batch: window.PDDEvaluationHelper[mode === 'report' ? 'readReportBatch' : 'readBatch'](),
   ...(mode === 'report' ? { journal: window.PDDEvaluationHelper.readReportJournal(),
-    quota: window.PDDEvaluationHelper.readReportQuota() } : {}),
+    stats: window.PDDEvaluationHelper.readReportStats() } : {}),
 }), mode);
 
 // 只在内存中增强原有夹具，不改写用户已有的batch-fixture.html。
@@ -80,11 +80,11 @@ async function seedUnknown(page) {
     rec.reported = true;
     rec.acceptedText = '已举报，待审核';
     const reportText = document.querySelector('#pdd-evaluation-helper-panel').shadowRoot
-      .querySelector('#report-copy').textContent;
+      .querySelector('#report-copy').value;
     const entry = { id: 'synthetic-pagination-unknown',
       key: JSON.stringify([rec.order, rec.goodsId, rec.time]), shop: '',
       order: rec.order, goodsId: rec.goodsId, time: rec.time, star: rec.star,
-      day: window.PDDEvaluationHelper.readReportQuota().day, status: 'submitted_unverified',
+      day: new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }), status: 'submitted_unverified',
       reportText, reason: '同行恶意差评', evidence: 'TIMEOUT', at: new Date().toISOString(),
       history: [{ status: 'submitting', at: new Date().toISOString() }] };
     localStorage.setItem('pdd-evaluation-helper:reports:v1',
@@ -161,7 +161,7 @@ test('没有任何页码证据仍能先查询1星再核验，目标1零提交', 
   const s = await state(page, 'report');
   assert.equal(s.queries.length, 1);
   assert.equal(s.submissions.length, 0);
-  assert.deepEqual([s.quota.confirmed, s.quota.uncertain, s.quota.remaining], [1, 0, 29]);
+  assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [1, 0]);
 });
 test('旧未知恢复1条后用status继续目标2，仅新增1条', 'report', async page => {
   await seedUnknown(page);
@@ -169,8 +169,8 @@ test('旧未知恢复1条后用status继续目标2，仅新增1条', 'report', a
   assert.equal(result.reported, 2, result.message);
   const s = await state(page, 'report');
   assert.equal(s.submissions.length, 1);
-  assert.equal(s.quota.confirmed, 2);
-  assert.equal(s.quota.uncertain, 0);
+  assert.equal(s.stats.confirmed, 2);
+  assert.equal(s.stats.uncertain, 0);
 });
 test('查询后的核验不依赖页码仍等待加载完成，随后恢复而不新增提交', 'report', async page => {
   await seedUnknown(page);
@@ -192,7 +192,7 @@ test('核验不依赖页码但短暂受理状态仍不能恢复', 'report', asyn
   });
   assert.equal((await run(page, 'report')).code, 'UNRESOLVED_REPORT_HISTORY');
   const s = await state(page, 'report');
-  assert.equal(s.quota.uncertain, 1);
+  assert.equal(s.stats.uncertain, 1);
   assert.equal(s.queries.length, 1);
   assert.equal(s.submissions.length, 0);
 });
@@ -202,8 +202,8 @@ test('恢复后仍无页码且目标2时保留恢复1条，停止而不提交', 
   assert.equal((await run(page, 'report', { n: 2 })).code, 'PAGE_UNREADABLE');
   const s = await state(page, 'report');
   assert.equal(s.batch.summary.reported, 1);
-  assert.equal(s.quota.confirmed, 1);
-  assert.equal(s.quota.uncertain, 0);
+  assert.equal(s.stats.confirmed, 1);
+  assert.equal(s.stats.uncertain, 0);
   assert.equal(s.submissions.length, 0);
   assert.equal(s.batch.error.details.stage, 'pagination');
 });
@@ -227,7 +227,7 @@ test('不可见旧未知保存查询后候选身份，无法确认分页仍停�
   assert.ok(Date.parse(d.observedAt) >= Date.parse(s.batch.startedAt));
   assert.equal(s.queries.length, 1);
   assert.equal(s.submissions.length, 0);
-  assert.equal(s.quota.uncertain, 1);
+  assert.equal(s.stats.uncertain, 1);
 });
 
 async function main() {

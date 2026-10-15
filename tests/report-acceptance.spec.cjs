@@ -20,17 +20,17 @@ const run = (page, options = { n: 1 }) => page.evaluate(options =>
   })), options);
 const state = page => page.evaluate(() => ({
   ...window.sim, journal: window.PDDEvaluationHelper.readReportJournal(),
-  quota: window.PDDEvaluationHelper.readReportQuota(), batch: window.PDDEvaluationHelper.readReportBatch(),
+  stats: window.PDDEvaluationHelper.readReportStats(), batch: window.PDDEvaluationHelper.readReportBatch(),
 }));
 async function seedUnknown(page, changes = {}) {
   await page.evaluate(changes => {
     const rec = window.sim.records[0];
     rec.acceptedText = '已举报，待审核'; rec.reported = true;
     const reportText = document.querySelector('#pdd-evaluation-helper-panel').shadowRoot
-      .querySelector('#report-copy').textContent;
+      .querySelector('#report-copy').value;
     const entry = { id: 'synthetic-unknown', key: JSON.stringify([rec.order, rec.goodsId, rec.time]),
       shop: '', order: rec.order, goodsId: rec.goodsId, time: rec.time, star: rec.star,
-      day: window.PDDEvaluationHelper.readReportQuota().day, status: 'submitted_unverified',
+      day: new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }), status: 'submitted_unverified',
       reportText, reason: '同行恶意差评', evidence: 'TIMEOUT', at: new Date().toISOString(),
       history: [{ status: 'submitting', at: new Date().toISOString() }], ...changes };
     localStorage.setItem('pdd-evaluation-helper:reports:v1', JSON.stringify({ schema: 1, attempts: [entry] }));
@@ -50,7 +50,7 @@ async function main() {
     assert.equal(s.submissions.length, 2);
     assert.deepEqual(s.journal.attempts.map(entry => entry.evidence),
       ['record_report_accepted', 'record_report_accepted']);
-    assert.deepEqual([s.quota.confirmed, s.quota.uncertain, s.quota.remaining], [2, 0, 28]);
+    assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [2, 0]);
     assert.equal(s.batch.records[0].submissionDiagnostics.status.text, '已举报，待审核');
   });
   test('受理状态延迟加载仍等待稳定后只提交一次', async page => {
@@ -69,7 +69,7 @@ async function main() {
       await page.evaluate(scenario => { window.sim.acceptanceScenario = scenario; }, scenario);
       assert.equal((await run(page)).code, 'REPORT_SUBMITTED_UNVERIFIED');
       const s = await state(page);
-      assert.deepEqual([s.quota.confirmed, s.quota.uncertain, s.quota.remaining], [0, 1, 29]);
+      assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [0, 1]);
       assert.equal(s.submissions.length, 1);
       assert.equal(s.batch.error.details.stage, 'after_submit');
       assert.equal(s.batch.error.details.waitError.code, 'TIMEOUT');
@@ -104,8 +104,8 @@ async function main() {
     assert.equal(s.batch.records[0].recovered, true);
     assert.equal(s.journal.attempts[0].history.at(-1).evidence, 'TIMEOUT');
     assert.equal(s.journal.attempts[0].verification.source, 'current_record_status');
-    assert.equal(s.quota.confirmed, 2);
-    assert.equal(s.quota.uncertain, 0);
+    assert.equal(s.stats.confirmed, 2);
+    assert.equal(s.stats.uncertain, 0);
   });
   test('带追评时间的旧记录可核验恢复，目标2仍只新增1条', async page => {
     await page.evaluate(() => {
@@ -132,7 +132,7 @@ async function main() {
     assert.equal(s.journal.attempts[0].key,
       JSON.stringify([s.records[0].order, s.records[0].goodsId, s.records[0].time]));
     assert.equal(s.journal.attempts[0].history.at(-1).evidence, 'TIMEOUT');
-    assert.deepEqual([s.quota.confirmed, s.quota.uncertain, s.quota.used], [2, 0, 2]);
+    assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [2, 0]);
     const submittedRecord = s.batch.records.find(record => !record.recovered);
     assert.equal(submittedRecord.timeDiagnostics.ignoredCount, 1);
   });
@@ -156,7 +156,7 @@ async function main() {
       assert.deepEqual(s.queries.map(entry => entry.star), Array.from({ length: star }, (_, i) => i + 1));
       assert.ok(s.queries.every(entry => entry.submitted === 0));
       assert.equal(s.submissions.length, 0);
-      assert.equal(s.quota.uncertain, 0);
+      assert.equal(s.stats.uncertain, 0);
     });
   }
   test('旧1星订单在第二页时查询并翻页核验，零重复举报', async page => {
@@ -184,8 +184,8 @@ async function main() {
     assert.equal(result.reported, 2, result.message);
     const s = await state(page);
     assert.equal(s.submissions.length, 1);
-    assert.equal(s.quota.confirmed, 2);
-    assert.equal(s.quota.uncertain, 0);
+    assert.equal(s.stats.confirmed, 2);
+    assert.equal(s.stats.uncertain, 0);
   });
   test('1星恢复后2星查询被禁用，已恢复计数和历史仍保留且零提交', async page => {
     await seedUnknown(page);
@@ -205,7 +205,7 @@ async function main() {
     const s = await state(page);
     assert.equal(s.batch.summary.reported, 1);
     assert.equal(s.batch.reconciled.length, 1);
-    assert.deepEqual([s.quota.confirmed, s.quota.uncertain], [1, 1]);
+    assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [1, 1]);
     assert.equal(s.submissions.length, 0);
   });
   test('旧2星恢复后新增举报从1星开始，恢复1条目标2只新增1条', async page => {
@@ -218,7 +218,7 @@ async function main() {
     assert.ok(s.queries.every(entry => entry.submitted === 0));
     assert.equal(s.submissions.length, 1);
     assert.equal(s.submissions[0].star, 1);
-    assert.equal(s.quota.confirmed, 2);
+    assert.equal(s.stats.confirmed, 2);
   });
   test('旧历史核验查询无完成证据时停止，原未知历史不改写且零提交', async page => {
     await seedUnknown(page);
@@ -229,7 +229,7 @@ async function main() {
     assert.equal((await run(page)).code, 'TIMEOUT');
     const s = await state(page);
     assert.equal(s.submissions.length, 0);
-    assert.equal(s.quota.uncertain, 1);
+    assert.equal(s.stats.uncertain, 1);
     assert.equal(await page.evaluate(() => localStorage.getItem('pdd-evaluation-helper:reports:v1')), before);
     assert.ok(s.filterClicks.includes('1星'));
   });
@@ -242,7 +242,7 @@ async function main() {
     assert.equal(s.queries.length, 1);
     assert.equal(s.batch.stopReason, 'target_reached');
   });
-  test('日额度已占30条时仍可核验，查询1星后零新增提交且不增加占额', async page => {
+  test('已有29条确认仍可恢复1条并新增1条完成目标2', async page => {
     await seedUnknown(page);
     await page.evaluate(() => {
       const data = window.PDDEvaluationHelper.readReportJournal();
@@ -253,21 +253,21 @@ async function main() {
       }
       localStorage.setItem('pdd-evaluation-helper:reports:v1', JSON.stringify(data));
     });
-    assert.equal((await run(page, { n: 2 })).reported, 1);
+    assert.equal((await run(page, { n: 2 })).reported, 2);
     const s = await state(page);
-    assert.equal(s.quota.confirmed, 30);
-    assert.equal(s.quota.uncertain, 0);
-    assert.equal(s.submissions.length, 0);
+    assert.equal(s.stats.confirmed, 31);
+    assert.equal(s.stats.uncertain, 0);
+    assert.equal(s.submissions.length, 1);
     assert.equal(s.queries.length, 1);
   });
-  test('历史日期的核验成功不计入今日目标，当前目标继续处理', async page => {
+  test('历史日期未知在本次确认成功可计目标，保留原日期且不重发', async page => {
     await seedUnknown(page, { day: '2026-10-01' });
     assert.equal((await run(page)).reported, 1);
     const s = await state(page);
-    assert.equal(s.submissions.length, 1);
-    assert.equal(s.quota.confirmed, 1);
+    assert.equal(s.submissions.length, 0);
+    assert.equal(s.stats.confirmed, 1);
     assert.equal(s.batch.reconciled[0].day, '2026-10-01');
-    assert.equal(s.batch.records[0].recovered, undefined);
+    assert.equal(s.batch.records[0].recovered, true);
   });
   test('指定其他商品时核验旧未知但不计入商品目标', async page => {
     await seedUnknown(page);
@@ -275,7 +275,7 @@ async function main() {
     assert.equal((await run(page, { n: 1, goodsId: otherGoods })).reported, 1);
     const s = await state(page);
     assert.equal(s.submissions.length, 1);
-    assert.equal(s.quota.confirmed, 2);
+    assert.equal(s.stats.confirmed, 2);
     assert.equal(s.batch.records[0].goodsId, otherGoods);
     assert.deepEqual(s.goodsEvents, ['', otherGoods]);
     assert.deepEqual(s.queries.map(entry => entry.submitted), [0, 0]);
@@ -291,7 +291,7 @@ async function main() {
     });
     assert.equal((await run(page, { n: 2 })).code, 'UNRESOLVED_REPORT_HISTORY');
     const s = await state(page);
-    assert.deepEqual([s.quota.confirmed, s.quota.uncertain], [1, 1]);
+    assert.deepEqual([s.stats.confirmed, s.stats.uncertain], [1, 1]);
     assert.equal(s.batch.summary.reported, 1);
     assert.equal(s.queries.length, 1);
     assert.equal(s.submissions.length, 0);
@@ -304,7 +304,7 @@ async function main() {
     });
     assert.equal((await run(page)).code, 'UNRESOLVED_REPORT_HISTORY');
     const s = await state(page);
-    assert.equal(s.quota.uncertain, 1);
+    assert.equal(s.stats.uncertain, 1);
     assert.equal(s.journal.attempts[0].submissionDiagnostics.rowError.code, 'DUPLICATE_RECORD');
   });
   test('恢复台账持久化失败时查询1星后仍不提交', async page => {
@@ -318,7 +318,7 @@ async function main() {
     });
     assert.equal((await run(page)).code, 'STORAGE_UNAVAILABLE');
     const s = await state(page);
-    assert.equal(s.quota.uncertain, 1);
+    assert.equal(s.stats.uncertain, 1);
     assert.equal(s.queries.length, 1);
     assert.equal(s.submissions.length, 0);
   });
@@ -344,7 +344,7 @@ async function main() {
       const s = await state(page);
       assert.equal(s.submissions.length, 0);
       assert.equal(s.queries.length, 1);
-      assert.equal(s.quota.uncertain, 1);
+      assert.equal(s.stats.uncertain, 1);
     });
   }
   test('安装与检查状态保持只读，不自动修改待核验台账', async page => {
@@ -367,7 +367,7 @@ async function main() {
     });
     await second.waitForFunction(() => Boolean(window.releaseTestLock));
     assert.equal((await run(page)).code, 'OTHER_TAB_BUSY');
-    assert.equal((await state(page)).quota.uncertain, 1);
+    assert.equal((await state(page)).stats.uncertain, 1);
     await second.evaluate(() => window.releaseTestLock());
   });
   test('核验等待期间急停不修改台账也不新增提交', async page => {
@@ -378,7 +378,7 @@ async function main() {
       return pending;
     });
     assert.equal(code, 'CANCELLED');
-    assert.equal((await state(page)).quota.uncertain, 1);
+    assert.equal((await state(page)).stats.uncertain, 1);
     assert.equal((await state(page)).submissions.length, 0);
   });
 

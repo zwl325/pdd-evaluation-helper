@@ -455,7 +455,7 @@ async function main() {
     const panel = page.locator('#pdd-evaluation-helper-panel');
     await panel.locator('#stop').click();
     assert.equal((await page.evaluate(() => window.pending)).code, 'CANCELLED');
-    assert.equal(await page.locator('textarea').inputValue(), replyText);
+    assert.equal(await page.locator('[data-testid="beast-core-modal-inner"] textarea').inputValue(), replyText);
     const s = await state(page);
     assert.equal(s.opens.length, 1);
     assert.equal(s.submissions.length, 0);
@@ -507,7 +507,7 @@ async function main() {
   test('评价路径直接筛选查询回复，保留URL和页面状态及检查入口', 'normal', async page => {
     await enableNavigationInjection(page);
     const panel = page.locator('#pdd-evaluation-helper-panel');
-    assert.equal(await panel.locator('#body button').count(), 4);
+    assert.equal(await panel.locator('#body button').count(), 6);
     await panel.locator('#batch-n').fill('2');
     await page.evaluate(() => { window.beforeReloadMarker = true; });
     await clickRunAndWait(page);
@@ -517,7 +517,7 @@ async function main() {
     assert.equal(s.submissions.length, 1);
     assert.deepEqual(await page.evaluate(() => window.sim.filterClicks), ['4星', '5星', '未回复']);
     assert.equal(await panel.locator('#batch-n').inputValue(), '2');
-    assert.equal(await panel.locator('#body button').count(), 4);
+    assert.equal(await panel.locator('#body button').count(), 6);
     assert.equal(await panel.locator('#run-once').isDisabled(), false);
     await panel.locator('#refresh').click();
     assert.match(await panel.locator('#inspection').innerText(), /已检查2\/2条；确认回复1条；跳过1条/);
@@ -531,7 +531,7 @@ async function main() {
     const panel = page.locator('#pdd-evaluation-helper-panel');
     await panel.locator('#reply-details summary').click();
     assert.equal(await panel.locator('#reply-copy').isVisible(), true);
-    assert.equal(await panel.locator('#reply-copy').innerText(), replyText);
+    assert.equal(await panel.locator('#reply-copy').inputValue(), replyText);
     assert.equal(replyText.length, 145);
     const downloadStarted = page.waitForEvent('download');
     await panel.locator('#export-batch').click();

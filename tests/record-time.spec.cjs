@@ -131,7 +131,7 @@ async function main() {
           const helper = window.PDDEvaluationHelper;
           return { batch: mode === 'report' ? helper.readReportBatch() : helper.readBatch(),
             journal: mode === 'report' ? helper.readReportJournal() : helper.readSubmissionJournal(),
-            quota: mode === 'report' ? helper.readReportQuota() : null,
+            stats: mode === 'report' ? helper.readReportStats() : null,
             visits: mode === 'report' ? window.sim.visits : window.sim.visited,
             submissions: window.sim.submissions, original: window.sim.records[0] };
         }, mode);
@@ -149,7 +149,7 @@ async function main() {
             assert.ok(state.batch.error.details.candidates.every(candidate => candidate.path && candidate.tag));
           }
           if (mode === 'report') {
-            assert.equal(state.quota.used, 0);
+            assert.equal(state.stats.uncertain, 0);
             assert.deepEqual(state.journal.attempts, []);
           } else assert.deepEqual(state.journal.entries, {});
           // 错误发生在建记录之前，也必须能从两种模式的导出台账读取候选节点。
@@ -171,7 +171,7 @@ async function main() {
           if (scenario.name.startsWith('同值') || scenario.name.startsWith('父子')) {
             assert.equal(record.timeDiagnostics.source, 'same_value_duplicates');
           }
-          if (mode === 'report') assert.equal(state.quota.confirmed, successes);
+          if (mode === 'report') assert.equal(state.stats.confirmed, successes);
           if (scenario.repeat) {
             const repeated = await page.evaluate(async mode => {
               const rec = window.sim.records[0];
