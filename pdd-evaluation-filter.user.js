@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-15.2
+// @name         PDD评价筛选助手 v2026-10-15.3
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-15.2
+// @version      2026-10-15.3
 // @description  PDD自动筛选回复与差评举报，支持成功计数、一星正文不限举报、可编辑文案、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-15.2',
+    version: '2026-10-15.3',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -2139,7 +2139,7 @@
             <button id="report-run-once" type="button">一键运行</button>
             <button id="report-stop" type="button" aria-describedby="report-stop-help">急停</button>
             <p id="report-stop-help" class="hint">停止后续操作；已提交的举报无法撤销。</p>
-            <button id="report-one-star" type="button">仅举报1星（正文不限）</button>
+            <button id="report-one-star" type="button">无条件举报1星</button>
             <p class="hint">此按钮使用上方举报数量和商品ID，只处理1星；包含有文字评价。</p>
             <p id="report-status" role="status" aria-live="polite"></p>
             <div class="tools">
