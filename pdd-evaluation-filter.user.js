@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PDD评价筛选助手 v2026-10-15.5
+// @name         PDD评价筛选助手 v2026-10-16.1
 // @namespace    urn:local:pdd:evaluation-helper
-// @version      2026-10-15.5
+// @version      2026-10-16.1
 // @description  PDD自动筛选回复与差评举报，支持成功计数、一星正文不限举报、可编辑文案、台账及可拖拽折叠面板。
 // @author       zwl325
 // @homepageURL  https://github.com/zwl325/pdd-evaluation-helper
@@ -21,7 +21,7 @@
   // 单文件便于安装；模块只通过明确接口协作。后续业务模块可复用 DOM / Wait。
   // 定位依据：原点击清单（2026-10-12）及举报定位元素.txt（2026-10-14），非实时DOM。
   const Config = Object.freeze({
-    version: '2026-10-15.5',
+    version: '2026-10-16.1',
     host: 'mms.pinduoduo.com',
     rootSelector: '#mf-mms-goods-container',
     filterSelector: 'div[class*="evaluation_search_btn"]',
@@ -1219,8 +1219,11 @@
     function acceptedStatus(group) {
       const headers = ReviewDOM.all('.evaluation-item-header', group).filter(DOM.visible);
       if (headers.length !== 1) return { accepted: false, text: '', headerCount: headers.length };
+      // 记录头部可能直接从待审核进入成功终态；两种完整文字共用同一身份／入口核验。
+      // 不能在整页搜索“举报成功”，也不依赖颜色、动态图标类名或全局瞬时提示。
       const matches = ReviewDOM.all('*', headers[0]).filter(element =>
-        DOM.visible(element) && /^已举报[，,]\s*待审核$/.test(ReviewDOM.text(element)));
+        DOM.visible(element) &&
+          /^(?:已举报[，,]\s*待审核|举报成功[，,]\s*不计入店铺考核)$/.test(ReviewDOM.text(element)));
       const texts = [...new Set(matches.map(ReviewDOM.text))];
       const linkCount = ReviewDOM.all(Config.selectors.reportLink, group).filter(DOM.visible).length;
       return { accepted: texts.length === 1 && linkCount === 0, text: texts.join(' | '),
@@ -1409,7 +1412,7 @@
           ({ id, reading: ReportDOM.evidenceSignature(reading) })));
         if (current !== signature) { signature = current; return false; }
         return values;
-      }, { ...options, description: '核验同一评价的已举报待审核状态' });
+      }, { ...options, description: '核验同一评价的举报受理或成功状态' });
       options.guard();
       const data = journal();
       const recovered = [];

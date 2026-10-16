@@ -30,6 +30,7 @@ jobs:
           node --check tests/audit-storage.spec.cjs
           node --check tests/audit-dom.spec.cjs
           node --check tests/report-acceptance.spec.cjs
+          node --check tests/report-final-status.spec.cjs
           node --check tests/pagination.spec.cjs
           node --check tests/metadata.spec.cjs
       - name: Check version and update metadata
